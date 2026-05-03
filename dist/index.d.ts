@@ -196,7 +196,27 @@ export declare function getEnhancedPath(options?: {
  * `process.env` for missing keys (covers legacy jobs without snapshot).
  */
 export declare function pickBootstrapEnv(job: Job, terminalPath: string): Record<string, string>;
+/**
+ * Parse a `sessionPolicy` argument supplied by the agent. Strict — no
+ * default, no silent fallback. F1 makes `sessionPolicy` REQUIRED on
+ * `schedule_job` so the agent must always elicit an explicit choice
+ * from the user; a silent default ('current') was the root cause of
+ * the "Status: success but TUI never refreshed" reproduction (see
+ * EXECUTION LOG and Findings A in the plan).
+ *
+ * For reading persisted `job.json` files that pre-date F1, use
+ * {@link getEffectiveSessionPolicy} which falls back to `current`.
+ */
 export declare function parseSessionPolicy(raw: unknown): SessionPolicy;
+/**
+ * Resolve the effective `sessionPolicy` for an already-persisted job.
+ * Defaults to `current` for back-compat with `job.json` files written
+ * before F1 made the arg required on `schedule_job`. Read paths only;
+ * NEVER reuse on the schedule_job arg path — see {@link parseSessionPolicy}.
+ */
+export declare function getEffectiveSessionPolicy(job: {
+    sessionPolicy?: SessionPolicy;
+}): SessionPolicy;
 export declare function parseExecutionPolicy(raw: unknown): ExecutionPolicy;
 export declare function parseDeliveryPolicy(raw: unknown): DeliveryPolicy;
 /**
@@ -215,6 +235,84 @@ export declare function validateSessionPolicyArgs(input: {
     attachUrl?: string;
     toolSessionID?: string;
 }): string | undefined;
+/**
+ * `serverUrl` from the Plugin runtime is `http://opencode.internal/...`
+ * when the host opencode was launched without `--port`. Used by F2a
+ * to decide whether to warn the user that live in-TUI delivery is
+ * impossible for the chosen sessionPolicy.
+ */
+export declare function isInternalServerUrl(serverUrl: URL | string): boolean;
+/**
+ * Resolve the effective `attachUrl` for a `schedule_job` call,
+ * implementing F2a / F2b:
+ *
+ * - **Explicit `attachUrl` arg** → use as-is. No warning, no auto-attach.
+ * - **No arg + `executionPolicy === 'headless-only'`** → leave
+ *   `attachUrl` undefined and emit no warning. The user opted out of
+ *   live HTTP delivery on purpose; F2b auto-promotion would conflict
+ *   with that choice and trip the
+ *   "headless-only is incompatible with attachUrl" validator.
+ * - **No arg + external `serverUrl`** (`http://127.0.0.1:N/...` because
+ *   the host opencode was started with `--port`) → auto-promote
+ *   `serverUrl` to `attachUrl` (F2b). The plugin already lives inside
+ *   that opencode process, so any prompt delivered there refreshes the
+ *   live TUI. Returns `autoFromServerUrl: true` so the caller can log
+ *   the substitution.
+ * - **No arg + internal `serverUrl`** (`http://opencode.internal/...`)
+ *   AND `sessionPolicy` routes to the calling TUI (`current` /
+ *   `existing`) → leave `attachUrl` undefined and set
+ *   `internalWarning: true` so the caller appends a warning explaining
+ *   that the open TUI will not refresh until reopened (F2a).
+ * - **No arg + internal `serverUrl`** + `sessionPolicy` is
+ *   `new-per-job` / `new-per-run` → no warning (the new session is not
+ *   the user's currently open TUI; headless delivery into a brand-new
+ *   session is the expected, correct behavior).
+ */
+export declare function resolveEffectiveAttachUrl(input: {
+    argAttachUrl?: string;
+    serverUrl: URL | string;
+    sessionPolicy: SessionPolicy;
+    executionPolicy: ExecutionPolicy;
+}): {
+    attachUrl?: string;
+    autoFromServerUrl: boolean;
+    internalWarning: boolean;
+};
+/**
+ * Build the F2a warning block appended to `schedule_job` success output
+ * when the host opencode is in-process-only and live delivery into the
+ * calling TUI is impossible.
+ */
+export declare function buildInternalServerWarning(): string;
+/**
+ * Structural status returned by `ensureBestPracticesSkill`. Pulled out
+ * as a named type so {@link formatScheduleJobSuccess} can be tested
+ * without spinning up the real skill installer.
+ */
+export interface SkillEnsureStatus {
+    status: "present" | "installed" | "failed";
+    path: string;
+    reason?: string;
+}
+/**
+ * Render the `schedule_job` success text. Pulled out of the tool body
+ * so the F2a warning placement (and F2b auto-attach line) can be unit
+ * tested without spinning up the full plugin runtime / fs / OS scheduler
+ * stack. The tool body wires the inputs; this function owns the layout.
+ */
+export declare function formatScheduleJobSuccess(input: {
+    name: string;
+    schedule: string;
+    scheduleHuman: string;
+    platformName: string;
+    workdir: string;
+    attachUrl?: string;
+    attachUrlAutoFromServerUrl: boolean;
+    primaryLine: string;
+    skillEnsure: SkillEnsureStatus;
+    internalWarning: boolean;
+    reliabilityLine: string;
+}): string;
 /**
  * Narrow shape of the OpenCode SDK client we need for session creation.
  * Structurally compatible with `OpencodeClient` so `client` can be passed

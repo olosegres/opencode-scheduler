@@ -12907,8 +12907,10 @@ Then write your task below it.
 
 ## Choosing a Session Policy
 
-\`schedule_job\` accepts \`sessionPolicy\` (default: \`current\`). Pick by what
-you want the run to feel like in the TUI:
+\`schedule_job\` REQUIRES an explicit \`sessionPolicy\` \u2014 there is no default.
+Always ask the user which one fits their intent before scheduling; a silent
+default leads to silent failures (job runs, TUI never refreshes). Pick by
+what you want the run to feel like in the TUI:
 
 | Policy          | When                                                                                  | Effect                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
@@ -14086,19 +14088,25 @@ function formatGlobalCleanupOutput(execution) {
   return lines.join(`
 `);
 }
+var SESSION_POLICY_REQUIRED_MESSAGE = "sessionPolicy is required. Pick one: 'current' (continue this chat), 'existing' (write into a specific session \u2014 supply sessionId), 'new-per-job' (one fresh session reused forever), 'new-per-run' (a fresh session every fire). Ask the user which one fits their intent \u2014 do not guess.";
 function parseSessionPolicy(raw) {
-  if (raw === undefined || raw === null)
-    return "current";
+  if (raw === undefined || raw === null) {
+    throw new Error(SESSION_POLICY_REQUIRED_MESSAGE);
+  }
   if (typeof raw !== "string") {
     throw new Error("sessionPolicy must be a string");
   }
   const trimmed = raw.trim();
-  if (!trimmed)
-    return "current";
+  if (!trimmed) {
+    throw new Error(SESSION_POLICY_REQUIRED_MESSAGE);
+  }
   if (trimmed === "current" || trimmed === "existing" || trimmed === "new-per-job" || trimmed === "new-per-run") {
     return trimmed;
   }
   throw new Error(`Invalid sessionPolicy: ${trimmed} (expected: current | existing | new-per-job | new-per-run)`);
+}
+function getEffectiveSessionPolicy(job) {
+  return job.sessionPolicy ?? "current";
 }
 function parseExecutionPolicy(raw) {
   if (raw === undefined || raw === null)
@@ -14154,6 +14162,75 @@ function normalizeAttachUrl(attachUrl) {
     throw new Error(`Invalid attach URL: ${attachUrl}`);
   }
   return trimmed;
+}
+var INTERNAL_SERVER_HOSTNAME = "opencode.internal";
+function isInternalServerUrl(serverUrl) {
+  try {
+    const url2 = typeof serverUrl === "string" ? new URL(serverUrl) : serverUrl;
+    return url2.hostname === INTERNAL_SERVER_HOSTNAME;
+  } catch {
+    return false;
+  }
+}
+function resolveEffectiveAttachUrl(input) {
+  if (input.argAttachUrl && input.argAttachUrl.trim()) {
+    return {
+      attachUrl: normalizeAttachUrl(input.argAttachUrl),
+      autoFromServerUrl: false,
+      internalWarning: false
+    };
+  }
+  if (input.executionPolicy === "headless-only") {
+    return { attachUrl: undefined, autoFromServerUrl: false, internalWarning: false };
+  }
+  const serverUrlString = typeof input.serverUrl === "string" ? input.serverUrl : input.serverUrl.toString();
+  if (isInternalServerUrl(input.serverUrl)) {
+    const routesToCallingTui = input.sessionPolicy === "current" || input.sessionPolicy === "existing";
+    return {
+      attachUrl: undefined,
+      autoFromServerUrl: false,
+      internalWarning: routesToCallingTui
+    };
+  }
+  return {
+    attachUrl: normalizeAttachUrl(serverUrlString),
+    autoFromServerUrl: true,
+    internalWarning: false
+  };
+}
+function buildInternalServerWarning() {
+  return [
+    "WARNING: this opencode is running without an external HTTP port (serverUrl is http://opencode.internal/...).",
+    "Scheduled runs will deliver via headless opencode: messages land in storage immediately, but the open TUI",
+    "will NOT refresh until you re-open the session. To get live in-TUI delivery, restart opencode with",
+    "`--port 0` (OS-assigned random port) or `--port N`, then re-create the job \u2014 the plugin will auto-detect",
+    "the new serverUrl and attach to it. Once the upstream Zod fix lands you can also set `server.port: 0` in",
+    "`~/.config/opencode/opencode.json` and skip the CLI flag."
+  ].join(" ");
+}
+function formatScheduleJobSuccess(input) {
+  const attachLine = input.attachUrl ? input.attachUrlAutoFromServerUrl ? `Attach URL: ${input.attachUrl} (auto-detected from this opencode's serverUrl; pass attachUrl explicitly to override)
+` : `Attach URL: ${input.attachUrl}
+` : "";
+  const internalWarningBlock = input.internalWarning ? `
+${buildInternalServerWarning()}
+` : "";
+  const skillLine = input.skillEnsure.status === "installed" ? `
+Installed scheduled-job-best-practices skill at ${input.skillEnsure.path}` : input.skillEnsure.status === "failed" ? `
+Note: could not install scheduled-job-best-practices skill (${input.skillEnsure.reason}); add it manually with install_skill` : "";
+  return `Scheduled "${input.name}"
+
+Schedule: ${input.schedule} (${input.scheduleHuman})
+Platform: ${input.platformName}
+Working Directory: ${input.workdir}
+${attachLine}${input.primaryLine}${skillLine}
+${internalWarningBlock}
+${input.reliabilityLine}
+
+Commands:
+- "run ${input.name} now" - run immediately
+- "show my jobs" - list all
+- "delete job ${input.name}" - remove`;
 }
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -14762,6 +14839,13 @@ function formatJobDetails(job) {
   if (run?.session) {
     lines.push(`Session: ${run.session}`);
   }
+  lines.push(`Session Policy: ${getEffectiveSessionPolicy(job)}`);
+  if (job.executionPolicy) {
+    lines.push(`Execution Policy: ${job.executionPolicy}`);
+  }
+  if (job.deliveryPolicy) {
+    lines.push(`Delivery Policy: ${job.deliveryPolicy}`);
+  }
   if (run?.port !== undefined) {
     lines.push(`Port: ${run.port}`);
   }
@@ -14882,10 +14966,15 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
           "Persists to an OS-level scheduler entry that survives reboots and runs whether opencode",
           "is open or not (this is NOT an in-process timer).",
           "NOT for one-off 'run this now' \u2014 use run_job. NOT for editing an existing job \u2014 use update_job.",
-          "Choose sessionPolicy: 'current' (default; continues this chat), 'new-per-job' (independent",
-          "long-running task with its own thread), 'new-per-run' (stateless, fresh thread per fire),",
-          "'existing' (user supplied an explicit sessionId). Pass attachUrl when a live opencode",
-          "server is reachable for live HTTP delivery instead of spawning a headless CLI.",
+          "sessionPolicy is REQUIRED \u2014 no default. ALWAYS elicit the choice from the user explicitly,",
+          "do not guess; a silent default leads to silent failures (job runs, TUI never refreshes).",
+          "Options: 'current' (continues this chat \u2014 fine for reminders that should land in the",
+          "current thread), 'new-per-job' (one fresh long-running session reused by every fire \u2014",
+          "best for independent background tasks), 'new-per-run' (a brand-new session every fire \u2014",
+          "best for stateless probes), 'existing' (user supplied an explicit sessionId).",
+          "attachUrl is best-effort: omit it and the plugin auto-detects the serverUrl of the",
+          "opencode you are running in (when launched with --port). Pass it explicitly only when",
+          "targeting a different opencode server.",
           "Auto-installs the scheduled-job-best-practices skill into the workdir if not already",
           "present (idempotent; existing files are left untouched), so scheduled prompts can",
           "reference it via @scheduled-job-best-practices without a separate install_skill call."
@@ -14909,7 +14998,7 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
           source: tool.schema.string().optional().describe("Optional: source app (e.g. 'marketplace') - used for filtering"),
           workdir: tool.schema.string().optional().describe("Optional: working directory to run from (for MCP config). Defaults to current directory."),
           attachUrl: tool.schema.string().optional().describe("Optional: attach URL for opencode run (e.g. http://localhost:4096)."),
-          sessionPolicy: tool.schema.string().optional().describe("Optional: 'current' (default; into calling session), 'existing' (require sessionId), 'new-per-job' (create one session up-front), 'new-per-run' (fresh session each fire)."),
+          sessionPolicy: tool.schema.string().describe("REQUIRED \u2014 no default. Ask the user which policy fits before calling. 'current' (continues this chat \u2014 for reminders into the live thread; needs a TUI launched with --port for live in-TUI delivery, otherwise the message lands in storage but the open TUI does not refresh until reopen), 'existing' (write into an explicit sessionId \u2014 supply sessionId), 'new-per-job' (one fresh session reused by every fire \u2014 for independent long-running background tasks), 'new-per-run' (a brand-new session every fire \u2014 for stateless probes)."),
           sessionId: tool.schema.string().optional().describe("Optional: explicit session id (required when sessionPolicy='existing')."),
           executionPolicy: tool.schema.string().optional().describe("Optional: 'prefer-live-server' (default; live HTTP delivery if reachable, else headless) or 'headless-only' (always spawn CLI, no live HTTP)."),
           deliveryPolicy: tool.schema.string().optional().describe("Optional: 'execute' (default; wait for idle session) or 'leave-message' (post immediately with noReply, user picks up later)."),
@@ -14965,9 +15054,8 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, `Invalid run spec: ${msg}`);
           }
-          let attachUrl;
           try {
-            attachUrl = normalizeAttachUrl(args.attachUrl);
+            normalizeAttachUrl(args.attachUrl);
           } catch (error45) {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, msg);
@@ -14999,6 +15087,19 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
             const msg = error45 instanceof Error ? error45.message : String(error45);
             return errorResult(format, msg);
           }
+          let effectiveAttachUrl;
+          try {
+            effectiveAttachUrl = resolveEffectiveAttachUrl({
+              argAttachUrl: args.attachUrl,
+              serverUrl,
+              sessionPolicy,
+              executionPolicy
+            });
+          } catch (error45) {
+            const msg = error45 instanceof Error ? error45.message : String(error45);
+            return errorResult(format, msg);
+          }
+          const attachUrl = effectiveAttachUrl.attachUrl;
           const policyError = validateSessionPolicyArgs({
             sessionPolicy,
             executionPolicy,
@@ -15091,24 +15192,25 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
             const platformName = backend;
             const reliabilityLine = backend === "schtasks" ? "Windows note: scheduled runs use Task Scheduler directly. For advanced reliability guarantees, prefer simple cron schedules or split complex jobs." : backend === "cron" ? "Cron note: missed runs during sleep are not replayed. For catch-up behavior, use launchd or systemd when available." : "The job will run at the scheduled time. If your computer was asleep, it will catch up when it wakes.";
             const primaryLine = run.command ? `Command: ${run.command}${run.arguments ? ` ${run.arguments}` : ""}` : `Prompt: ${(run.prompt ?? "").slice(0, 100)}${(run.prompt ?? "").length > 100 ? "..." : ""}`;
-            const attachLine = run.attachUrl ? `Attach URL: ${run.attachUrl}
-` : "";
-            const skillLine = skillEnsure.status === "installed" ? `
-Installed scheduled-job-best-practices skill at ${skillEnsure.path}` : skillEnsure.status === "failed" ? `
-Note: could not install scheduled-job-best-practices skill (${skillEnsure.reason}); add it manually with install_skill` : "";
-            return okResult(format, `Scheduled "${args.name}"
-
-Schedule: ${args.schedule} (${describeCron(args.schedule)})
-Platform: ${platformName}
-Working Directory: ${workdir}
-${attachLine}${primaryLine}${skillLine}
-
-${reliabilityLine}
-
-Commands:
-- "run ${args.name} now" - run immediately
-- "show my jobs" - list all
-- "delete job ${args.name}" - remove`, { job, skill: skillEnsure });
+            const successText = formatScheduleJobSuccess({
+              name: args.name,
+              schedule: args.schedule,
+              scheduleHuman: describeCron(args.schedule),
+              platformName,
+              workdir,
+              attachUrl: run.attachUrl,
+              attachUrlAutoFromServerUrl: effectiveAttachUrl.autoFromServerUrl,
+              primaryLine,
+              skillEnsure,
+              internalWarning: effectiveAttachUrl.internalWarning,
+              reliabilityLine
+            });
+            return okResult(format, successText, {
+              job,
+              skill: skillEnsure,
+              attachUrlSource: effectiveAttachUrl.autoFromServerUrl ? "serverUrl-auto" : attachUrl ? "explicit" : "none",
+              internalServerWarning: effectiveAttachUrl.internalWarning
+            });
           } catch (error45) {
             deleteJobFile(job);
             const msg = error45 instanceof Error ? error45.message : String(error45);

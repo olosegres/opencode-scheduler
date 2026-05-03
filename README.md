@@ -84,11 +84,11 @@ Each fire-time attempt appends a structured record to `~/.config/opencode/schedu
 
 ### Session policies
 
-`schedule_job` and `update_job` accept a `sessionPolicy` argument controlling which opencode session a scheduled run writes into:
+`schedule_job` REQUIRES `sessionPolicy` — there is no default. Always ask the user which one fits before scheduling; a silent default ('current') was the root cause of the "job ran but my TUI never refreshed" reproduction. `update_job` keeps the field optional (most updates change schedule/prompt, not policy).
 
 | Policy | Behavior |
 |--------|----------|
-| `current` (default) | Use the session that called `schedule_job`. Requires running from inside an opencode session, or `sessionId` passed explicitly. |
+| `current` | Use the session that called `schedule_job`. Requires running from inside an opencode session, or `sessionId` passed explicitly. For live in-TUI delivery, the host opencode must be launched with `--port` (otherwise `serverUrl` is `http://opencode.internal/...` and the message lands in storage but the open TUI does not refresh until reopen — `schedule_job` warns when this happens). |
 | `existing` | Use a session id you supply. Requires `sessionId`. |
 | `new-per-job` | Create one dedicated session at schedule-time and reuse it for every run. The new session gets `question`/`plan_enter`/`plan_exit` denied permanently. |
 | `new-per-run` | Create a fresh session at every fire (runner POSTs `/session` with the same deny rules). |

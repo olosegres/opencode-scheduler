@@ -859,8 +859,10 @@ Then write your task below it.
 
 ## Choosing a Session Policy
 
-\`schedule_job\` accepts \`sessionPolicy\` (default: \`current\`). Pick by what
-you want the run to feel like in the TUI:
+\`schedule_job\` REQUIRES an explicit \`sessionPolicy\` — there is no default.
+Always ask the user which one fits their intent before scheduling; a silent
+default leads to silent failures (job runs, TUI never refreshes). Pick by
+what you want the run to feel like in the TUI:
 
 | Policy          | When                                                                                  | Effect                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
@@ -2399,17 +2401,45 @@ function formatGlobalCleanupOutput(execution: GlobalCleanupExecution): string {
 
 // === Session policy parsers / validators (S4 + S6) ===
 
+const SESSION_POLICY_REQUIRED_MESSAGE =
+  "sessionPolicy is required. Pick one: 'current' (continue this chat), 'existing' (write into a specific session — supply sessionId), 'new-per-job' (one fresh session reused forever), 'new-per-run' (a fresh session every fire). Ask the user which one fits their intent — do not guess."
+
+/**
+ * Parse a `sessionPolicy` argument supplied by the agent. Strict — no
+ * default, no silent fallback. F1 makes `sessionPolicy` REQUIRED on
+ * `schedule_job` so the agent must always elicit an explicit choice
+ * from the user; a silent default ('current') was the root cause of
+ * the "Status: success but TUI never refreshed" reproduction (see
+ * EXECUTION LOG and Findings A in the plan).
+ *
+ * For reading persisted `job.json` files that pre-date F1, use
+ * {@link getEffectiveSessionPolicy} which falls back to `current`.
+ */
 export function parseSessionPolicy(raw: unknown): SessionPolicy {
-  if (raw === undefined || raw === null) return "current"
+  if (raw === undefined || raw === null) {
+    throw new Error(SESSION_POLICY_REQUIRED_MESSAGE)
+  }
   if (typeof raw !== "string") {
     throw new Error("sessionPolicy must be a string")
   }
   const trimmed = raw.trim()
-  if (!trimmed) return "current"
+  if (!trimmed) {
+    throw new Error(SESSION_POLICY_REQUIRED_MESSAGE)
+  }
   if (trimmed === "current" || trimmed === "existing" || trimmed === "new-per-job" || trimmed === "new-per-run") {
     return trimmed
   }
   throw new Error(`Invalid sessionPolicy: ${trimmed} (expected: current | existing | new-per-job | new-per-run)`)
+}
+
+/**
+ * Resolve the effective `sessionPolicy` for an already-persisted job.
+ * Defaults to `current` for back-compat with `job.json` files written
+ * before F1 made the arg required on `schedule_job`. Read paths only;
+ * NEVER reuse on the schedule_job arg path — see {@link parseSessionPolicy}.
+ */
+export function getEffectiveSessionPolicy(job: { sessionPolicy?: SessionPolicy }): SessionPolicy {
+  return job.sessionPolicy ?? "current"
 }
 
 export function parseExecutionPolicy(raw: unknown): ExecutionPolicy {
@@ -2484,6 +2514,170 @@ function normalizeAttachUrl(attachUrl?: string): string | undefined {
     throw new Error(`Invalid attach URL: ${attachUrl}`)
   }
   return trimmed
+}
+
+/**
+ * Sentinel hostname used by the opencode TUI worker when no `--port`
+ * was supplied (`opencode-fork/packages/opencode/src/cli/cmd/tui/worker.ts`).
+ * Routes traffic over the in-process IPC bridge instead of TCP, so
+ * any external process (supervisor, launchd job, fire-time runner)
+ * cannot reach it.
+ */
+const INTERNAL_SERVER_HOSTNAME = "opencode.internal"
+
+/**
+ * `serverUrl` from the Plugin runtime is `http://opencode.internal/...`
+ * when the host opencode was launched without `--port`. Used by F2a
+ * to decide whether to warn the user that live in-TUI delivery is
+ * impossible for the chosen sessionPolicy.
+ */
+export function isInternalServerUrl(serverUrl: URL | string): boolean {
+  try {
+    const url = typeof serverUrl === "string" ? new URL(serverUrl) : serverUrl
+    return url.hostname === INTERNAL_SERVER_HOSTNAME
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolve the effective `attachUrl` for a `schedule_job` call,
+ * implementing F2a / F2b:
+ *
+ * - **Explicit `attachUrl` arg** → use as-is. No warning, no auto-attach.
+ * - **No arg + `executionPolicy === 'headless-only'`** → leave
+ *   `attachUrl` undefined and emit no warning. The user opted out of
+ *   live HTTP delivery on purpose; F2b auto-promotion would conflict
+ *   with that choice and trip the
+ *   "headless-only is incompatible with attachUrl" validator.
+ * - **No arg + external `serverUrl`** (`http://127.0.0.1:N/...` because
+ *   the host opencode was started with `--port`) → auto-promote
+ *   `serverUrl` to `attachUrl` (F2b). The plugin already lives inside
+ *   that opencode process, so any prompt delivered there refreshes the
+ *   live TUI. Returns `autoFromServerUrl: true` so the caller can log
+ *   the substitution.
+ * - **No arg + internal `serverUrl`** (`http://opencode.internal/...`)
+ *   AND `sessionPolicy` routes to the calling TUI (`current` /
+ *   `existing`) → leave `attachUrl` undefined and set
+ *   `internalWarning: true` so the caller appends a warning explaining
+ *   that the open TUI will not refresh until reopened (F2a).
+ * - **No arg + internal `serverUrl`** + `sessionPolicy` is
+ *   `new-per-job` / `new-per-run` → no warning (the new session is not
+ *   the user's currently open TUI; headless delivery into a brand-new
+ *   session is the expected, correct behavior).
+ */
+export function resolveEffectiveAttachUrl(input: {
+  argAttachUrl?: string
+  serverUrl: URL | string
+  sessionPolicy: SessionPolicy
+  executionPolicy: ExecutionPolicy
+}): { attachUrl?: string; autoFromServerUrl: boolean; internalWarning: boolean } {
+  if (input.argAttachUrl && input.argAttachUrl.trim()) {
+    return {
+      attachUrl: normalizeAttachUrl(input.argAttachUrl),
+      autoFromServerUrl: false,
+      internalWarning: false,
+    }
+  }
+
+  // User explicitly chose headless — never auto-attach.
+  if (input.executionPolicy === "headless-only") {
+    return { attachUrl: undefined, autoFromServerUrl: false, internalWarning: false }
+  }
+
+  const serverUrlString = typeof input.serverUrl === "string" ? input.serverUrl : input.serverUrl.toString()
+
+  if (isInternalServerUrl(input.serverUrl)) {
+    const routesToCallingTui = input.sessionPolicy === "current" || input.sessionPolicy === "existing"
+    return {
+      attachUrl: undefined,
+      autoFromServerUrl: false,
+      internalWarning: routesToCallingTui,
+    }
+  }
+
+  // External serverUrl + no explicit arg → auto-promote.
+  return {
+    attachUrl: normalizeAttachUrl(serverUrlString),
+    autoFromServerUrl: true,
+    internalWarning: false,
+  }
+}
+
+/**
+ * Build the F2a warning block appended to `schedule_job` success output
+ * when the host opencode is in-process-only and live delivery into the
+ * calling TUI is impossible.
+ */
+export function buildInternalServerWarning(): string {
+  return [
+    "WARNING: this opencode is running without an external HTTP port (serverUrl is http://opencode.internal/...).",
+    "Scheduled runs will deliver via headless opencode: messages land in storage immediately, but the open TUI",
+    "will NOT refresh until you re-open the session. To get live in-TUI delivery, restart opencode with",
+    "`--port 0` (OS-assigned random port) or `--port N`, then re-create the job — the plugin will auto-detect",
+    "the new serverUrl and attach to it. Once the upstream Zod fix lands you can also set `server.port: 0` in",
+    "`~/.config/opencode/opencode.json` and skip the CLI flag.",
+  ].join(" ")
+}
+
+/**
+ * Structural status returned by `ensureBestPracticesSkill`. Pulled out
+ * as a named type so {@link formatScheduleJobSuccess} can be tested
+ * without spinning up the real skill installer.
+ */
+export interface SkillEnsureStatus {
+  status: "present" | "installed" | "failed"
+  path: string
+  reason?: string
+}
+
+/**
+ * Render the `schedule_job` success text. Pulled out of the tool body
+ * so the F2a warning placement (and F2b auto-attach line) can be unit
+ * tested without spinning up the full plugin runtime / fs / OS scheduler
+ * stack. The tool body wires the inputs; this function owns the layout.
+ */
+export function formatScheduleJobSuccess(input: {
+  name: string
+  schedule: string
+  scheduleHuman: string
+  platformName: string
+  workdir: string
+  attachUrl?: string
+  attachUrlAutoFromServerUrl: boolean
+  primaryLine: string
+  skillEnsure: SkillEnsureStatus
+  internalWarning: boolean
+  reliabilityLine: string
+}): string {
+  const attachLine = input.attachUrl
+    ? input.attachUrlAutoFromServerUrl
+      ? `Attach URL: ${input.attachUrl} (auto-detected from this opencode's serverUrl; pass attachUrl explicitly to override)\n`
+      : `Attach URL: ${input.attachUrl}\n`
+    : ""
+
+  const internalWarningBlock = input.internalWarning ? `\n${buildInternalServerWarning()}\n` : ""
+
+  const skillLine =
+    input.skillEnsure.status === "installed"
+      ? `\nInstalled scheduled-job-best-practices skill at ${input.skillEnsure.path}`
+      : input.skillEnsure.status === "failed"
+        ? `\nNote: could not install scheduled-job-best-practices skill (${input.skillEnsure.reason}); add it manually with install_skill`
+        : ""
+
+  return `Scheduled "${input.name}"
+
+Schedule: ${input.schedule} (${input.scheduleHuman})
+Platform: ${input.platformName}
+Working Directory: ${input.workdir}
+${attachLine}${input.primaryLine}${skillLine}
+${internalWarningBlock}
+${input.reliabilityLine}
+
+Commands:
+- "run ${input.name} now" - run immediately
+- "show my jobs" - list all
+- "delete job ${input.name}" - remove`
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -3230,6 +3424,20 @@ function formatJobDetails(job: Job): string {
     lines.push(`Session: ${run.session}`)
   }
 
+  // F1 back-compat: jobs scheduled before sessionPolicy was required
+  // have no field — fall back to 'current' for display so the agent
+  // sees the same effective semantics the runner / fire-time code
+  // assumes for legacy jobs.
+  lines.push(`Session Policy: ${getEffectiveSessionPolicy(job)}`)
+
+  if (job.executionPolicy) {
+    lines.push(`Execution Policy: ${job.executionPolicy}`)
+  }
+
+  if (job.deliveryPolicy) {
+    lines.push(`Delivery Policy: ${job.deliveryPolicy}`)
+  }
+
   if (run?.port !== undefined) {
     lines.push(`Port: ${run.port}`)
   }
@@ -3419,10 +3627,15 @@ export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
               "Persists to an OS-level scheduler entry that survives reboots and runs whether opencode",
               "is open or not (this is NOT an in-process timer).",
               "NOT for one-off 'run this now' — use run_job. NOT for editing an existing job — use update_job.",
-              "Choose sessionPolicy: 'current' (default; continues this chat), 'new-per-job' (independent",
-              "long-running task with its own thread), 'new-per-run' (stateless, fresh thread per fire),",
-              "'existing' (user supplied an explicit sessionId). Pass attachUrl when a live opencode",
-              "server is reachable for live HTTP delivery instead of spawning a headless CLI.",
+              "sessionPolicy is REQUIRED — no default. ALWAYS elicit the choice from the user explicitly,",
+              "do not guess; a silent default leads to silent failures (job runs, TUI never refreshes).",
+              "Options: 'current' (continues this chat — fine for reminders that should land in the",
+              "current thread), 'new-per-job' (one fresh long-running session reused by every fire —",
+              "best for independent background tasks), 'new-per-run' (a brand-new session every fire —",
+              "best for stateless probes), 'existing' (user supplied an explicit sessionId).",
+              "attachUrl is best-effort: omit it and the plugin auto-detects the serverUrl of the",
+              "opencode you are running in (when launched with --port). Pass it explicitly only when",
+              "targeting a different opencode server.",
               "Auto-installs the scheduled-job-best-practices skill into the workdir if not already",
               "present (idempotent; existing files are left untouched), so scheduled prompts can",
               "reference it via @scheduled-job-best-practices without a separate install_skill call.",
@@ -3462,9 +3675,8 @@ export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
               .describe("Optional: attach URL for opencode run (e.g. http://localhost:4096)."),
             sessionPolicy: tool.schema
               .string()
-              .optional()
               .describe(
-                "Optional: 'current' (default; into calling session), 'existing' (require sessionId), 'new-per-job' (create one session up-front), 'new-per-run' (fresh session each fire)."
+                "REQUIRED — no default. Ask the user which policy fits before calling. 'current' (continues this chat — for reminders into the live thread; needs a TUI launched with --port for live in-TUI delivery, otherwise the message lands in storage but the open TUI does not refresh until reopen), 'existing' (write into an explicit sessionId — supply sessionId), 'new-per-job' (one fresh session reused by every fire — for independent long-running background tasks), 'new-per-run' (a brand-new session every fire — for stateless probes)."
               ),
             sessionId: tool.schema
               .string()
@@ -3558,9 +3770,17 @@ export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
              return errorResult(format, `Invalid run spec: ${msg}`)
            }
 
-           let attachUrl: string | undefined
+           // Validate the explicit attachUrl arg first, so we surface a
+           // bad URL before any other policy-side resolution. The return
+           // value is intentionally discarded — `resolveEffectiveAttachUrl`
+           // (called later, after sessionPolicy is parsed) re-runs
+           // normalizeAttachUrl on the same input as part of F2b auto-
+           // promotion. This pre-check exists purely to fail fast with a
+           // clean error before the agent has to read past sessionPolicy
+           // / executionPolicy / deliveryPolicy errors. Do NOT delete as
+           // dead code.
            try {
-             attachUrl = normalizeAttachUrl(args.attachUrl)
+             normalizeAttachUrl(args.attachUrl)
            } catch (error) {
              const msg = error instanceof Error ? error.message : String(error)
              return errorResult(format, msg)
@@ -3573,7 +3793,11 @@ export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
              return errorResult(format, `Invalid cron schedule: ${msg}`)
            }
 
-           // === Session policy resolution (S4) ===
+           // === Session policy resolution (S4 + F1) ===
+           // F1: parseSessionPolicy throws on missing/empty. The Zod
+           // schema also requires it, but we keep the runtime check as
+           // defence in depth (e.g. if a caller bypasses validation by
+           // synthesizing a tool input directly).
            let sessionPolicy: SessionPolicy
            try {
              sessionPolicy = parseSessionPolicy(args.sessionPolicy)
@@ -3597,6 +3821,25 @@ export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
              const msg = error instanceof Error ? error.message : String(error)
              return errorResult(format, msg)
            }
+
+           // === Effective attachUrl (F2a + F2b) ===
+           // - explicit arg wins,
+           // - external serverUrl auto-promotes (F2b) ONLY when the
+           //   user did not opt into headless-only,
+           // - internal serverUrl + current/existing flags a warning (F2a).
+           let effectiveAttachUrl: ReturnType<typeof resolveEffectiveAttachUrl>
+           try {
+             effectiveAttachUrl = resolveEffectiveAttachUrl({
+               argAttachUrl: args.attachUrl,
+               serverUrl,
+               sessionPolicy,
+               executionPolicy,
+             })
+           } catch (error) {
+             const msg = error instanceof Error ? error.message : String(error)
+             return errorResult(format, msg)
+           }
+           const attachUrl = effectiveAttachUrl.attachUrl
 
            // S6: validation matrix.
            const policyError = validateSessionPolicyArgs({
@@ -3720,33 +3963,33 @@ export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
                ? `Command: ${run.command}${run.arguments ? ` ${run.arguments}` : ""}`
                : `Prompt: ${(run.prompt ?? "").slice(0, 100)}${(run.prompt ?? "").length > 100 ? "..." : ""}`
 
-            const attachLine = run.attachUrl ? `Attach URL: ${run.attachUrl}
-` : ""
+             const successText = formatScheduleJobSuccess({
+               name: args.name,
+               schedule: args.schedule,
+               scheduleHuman: describeCron(args.schedule),
+               platformName,
+               workdir,
+               attachUrl: run.attachUrl,
+               attachUrlAutoFromServerUrl: effectiveAttachUrl.autoFromServerUrl,
+               primaryLine,
+               skillEnsure,
+               internalWarning: effectiveAttachUrl.internalWarning,
+               reliabilityLine,
+             })
 
-            const skillLine =
-              skillEnsure.status === "installed"
-                ? `\nInstalled scheduled-job-best-practices skill at ${skillEnsure.path}`
-                : skillEnsure.status === "failed"
-                  ? `\nNote: could not install scheduled-job-best-practices skill (${skillEnsure.reason}); add it manually with install_skill`
-                  : ""
-
-            return okResult(
-              format,
-              `Scheduled "${args.name}"
-
-Schedule: ${args.schedule} (${describeCron(args.schedule)})
-Platform: ${platformName}
-Working Directory: ${workdir}
-${attachLine}${primaryLine}${skillLine}
-
-${reliabilityLine}
-
-Commands:
-- "run ${args.name} now" - run immediately
-- "show my jobs" - list all
-- "delete job ${args.name}" - remove`,
-              { job, skill: skillEnsure }
-            )
+             // Metadata block is exposed in the JSON-format response
+             // for debugging / observability. The shape is NOT a stable
+             // contract — downstream consumers should NOT key off
+             // `attachUrlSource` / `internalServerWarning` programmatically;
+             // those are documentation aids whose names and values may
+             // change between minor versions. Use the rendered text in
+             // the success output as the user-facing source of truth.
+             return okResult(format, successText, {
+               job,
+               skill: skillEnsure,
+               attachUrlSource: effectiveAttachUrl.autoFromServerUrl ? "serverUrl-auto" : (attachUrl ? "explicit" : "none"),
+               internalServerWarning: effectiveAttachUrl.internalWarning,
+             })
 
           } catch (error) {
             deleteJobFile(job)
