@@ -25,6 +25,8 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from "
 import { dirname, join } from "path"
 import { homedir } from "os"
 
+import { discoverLiveOpencode, fetchWithTimeout } from "./registry"
+
 interface RunnerArgs {
   jobPath: string
   timeoutSeconds?: number
@@ -66,6 +68,14 @@ interface RunRecord {
   timestamp: string
   delivery: "live" | "headless"
   attachUrl?: string
+  /**
+   * Where the runner got `attachUrl` from. `"job"` = persisted at
+   * schedule-time (explicit arg or F2b serverUrl auto-promote);
+   * `"registry"` = discovered from F5 plugin-side runtime registry
+   * at fire-time. Helps when post-mortem'ing a delivery that landed
+   * in an unexpected opencode instance.
+   */
+  attachUrlSource?: "job" | "registry"
   sessionId?: string
   httpStatus?: number
   error?: string
@@ -137,16 +147,6 @@ function newRunId(): string {
   const seconds = Math.floor(Date.now() / 1000)
   const random = Math.floor(Math.random() * 1_000_000_000).toString().padStart(9, "0")
   return `${seconds}-${random}`
-}
-
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController()
-  const id = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    return await fetch(url, { ...init, signal: controller.signal })
-  } finally {
-    clearTimeout(id)
-  }
 }
 
 function trimBaseUrl(url: string): string {
@@ -292,6 +292,7 @@ async function preflight(input: { baseUrl: string; sessionId?: string }): Promis
 async function runLive(input: {
   job: Job
   attachUrl: string
+  attachUrlSource?: "job" | "registry"
   sessionId?: string
   prompt: string
   files: string[]
@@ -302,6 +303,7 @@ async function runLive(input: {
   const t0 = Date.now()
   const runId = newRunId()
   const timestamp = new Date().toISOString()
+  const attachUrlSource = input.attachUrlSource ?? "job"
 
   const pre = await preflight({ baseUrl, sessionId: input.sessionId })
   if (pre === "no-server") {
@@ -312,6 +314,7 @@ async function runLive(input: {
         timestamp,
         delivery: "live",
         attachUrl: baseUrl,
+        attachUrlSource,
         sessionId: input.sessionId,
         error: "preflight: server unreachable",
         durationMs: Date.now() - t0,
@@ -327,6 +330,7 @@ async function runLive(input: {
         timestamp,
         delivery: "live",
         attachUrl: baseUrl,
+        attachUrlSource,
         sessionId: input.sessionId,
         error: "preflight: session not found",
         durationMs: Date.now() - t0,
@@ -359,6 +363,7 @@ async function runLive(input: {
             timestamp,
             delivery: "live",
             attachUrl: baseUrl,
+            attachUrlSource,
             sessionId,
             error: "session busy beyond timeout",
             durationMs: Date.now() - t0,
@@ -386,6 +391,7 @@ async function runLive(input: {
         timestamp,
         delivery: "live",
         attachUrl: baseUrl,
+        attachUrlSource,
         sessionId,
         httpStatus,
         durationMs: Date.now() - t0,
@@ -401,6 +407,7 @@ async function runLive(input: {
         timestamp,
         delivery: "live",
         attachUrl: baseUrl,
+        attachUrlSource,
         sessionId,
         error: msg,
         durationMs: Date.now() - t0,
@@ -408,6 +415,50 @@ async function runLive(input: {
       },
     }
   }
+}
+
+/**
+ * Decide where the runner should deliver the prompt.
+ *
+ *   1. If the job persisted an `attachUrl` at schedule-time (explicit
+ *      arg or F2b serverUrl auto-promote), use it as-is — the user
+ *      asked for that target.
+ *   2. Otherwise, when `sessionPolicy` resolved to a known sessionId
+ *      AND `executionPolicy !== 'headless-only'`, ask the F5 runtime
+ *      registry which live opencode currently sees this session.
+ *      `discoverLiveOpencode` does the alive + reachable + workdir-
+ *      affinity sort and returns the best candidate (or undefined).
+ *   3. When neither path produces a URL, the caller short-circuits to
+ *      exit 10 and `supervisor.pl` falls back to the headless
+ *      invocation.
+ *
+ * Pulled out of `main()` so the discovery glue is unit-testable
+ * without spinning up the runner CLI / fs.
+ */
+export async function resolveLiveAttachUrl(input: {
+  job: Job
+  run: JobRunSpec
+  executionPolicy: "prefer-live-server" | "headless-only"
+  discover?: typeof discoverLiveOpencode
+}): Promise<{ attachUrl?: string; source: "job" | "registry" | "none" }> {
+  const direct = input.run.attachUrl ?? input.job.attachUrl
+  if (direct) return { attachUrl: direct, source: "job" }
+
+  if (input.executionPolicy === "headless-only" || !input.run.session) {
+    return { attachUrl: undefined, source: "none" }
+  }
+
+  const discover = input.discover ?? discoverLiveOpencode
+  try {
+    const candidate = await discover({
+      sessionId: input.run.session,
+      workdir: input.job.workdir,
+    })
+    if (candidate) return { attachUrl: candidate.url, source: "registry" }
+  } catch {
+    // discovery is best-effort; treat as no candidate
+  }
+  return { attachUrl: undefined, source: "none" }
 }
 
 async function main(): Promise<number> {
@@ -430,10 +481,12 @@ async function main(): Promise<number> {
   }
 
   const run = getJobRun(job)
-  const attachUrl = run.attachUrl ?? job.attachUrl
   const executionPolicy = job.executionPolicy ?? "prefer-live-server"
   const deliveryPolicy = job.deliveryPolicy ?? "execute"
   const timeoutSeconds = args.timeoutSeconds ?? job.timeoutSeconds ?? 60
+
+  const resolved = await resolveLiveAttachUrl({ job, run, executionPolicy })
+  const attachUrl = resolved.attachUrl
 
   // S5 step 0: short-circuit when live delivery is impossible.
   if (!attachUrl || executionPolicy === "headless-only") {
@@ -444,7 +497,7 @@ async function main(): Promise<number> {
       attachUrl: attachUrl ? trimBaseUrl(attachUrl) : undefined,
       sessionId: run.session,
       error: !attachUrl
-        ? "no attachUrl on job; live delivery impossible"
+        ? "no attachUrl on job; live delivery impossible (F5 discovery found no live opencode that sees this session)"
         : "executionPolicy='headless-only'",
       durationMs: 0,
       exitCode: 10,
@@ -469,9 +522,14 @@ async function main(): Promise<number> {
     return 11
   }
 
+  // `resolved.source` is guaranteed 'job' | 'registry' here — the
+  // 'none' branch already short-circuited above.
+  const attachUrlSource: "job" | "registry" = resolved.source === "registry" ? "registry" : "job"
+
   const result = await runLive({
     job,
     attachUrl,
+    attachUrlSource,
     sessionId: run.session,
     prompt,
     files: run.files ?? [],

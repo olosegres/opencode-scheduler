@@ -13,6 +13,7 @@
  */
 import type { Plugin } from "@opencode-ai/plugin";
 import type { BadRequestError } from "@opencode-ai/sdk";
+import { type RegistryEntry } from "./registry";
 type OpencodeRunFormat = "default" | "json";
 type SchedulerEnvMode = "snapshot" | "minimal" | "login-shell";
 /**
@@ -277,6 +278,46 @@ export declare function resolveEffectiveAttachUrl(input: {
     attachUrl?: string;
     autoFromServerUrl: boolean;
     internalWarning: boolean;
+};
+/**
+ * Derive the registry entry for the calling opencode process from
+ * the plugin's `serverUrl` input. Returns `undefined` for the
+ * in-process IPC sentinel (`http://opencode.internal/...`) — those
+ * entries would be useless to any external reader.
+ *
+ * Exported so plugin init can stay declarative and so the helper is
+ * unit-testable without spinning up the full plugin runtime.
+ */
+export declare function buildOwnRegistryEntry(input: {
+    serverUrl: URL | string;
+    pid?: number;
+    workdir?: string;
+    startedAt?: string;
+    agent?: "tui" | "headless";
+}): RegistryEntry | undefined;
+/**
+ * Wire up F5 plugin-side bookkeeping for one opencode process:
+ *
+ *   1. Sweep stale entries left behind by previously-crashed
+ *      processes (cheap O(N) on every plugin init).
+ *   2. If the calling opencode is reachable externally (i.e. NOT the
+ *      in-process IPC sentinel), publish our own `<pid>.json` so the
+ *      scheduler runner can discover us at fire-time.
+ *   3. Register one-shot exit handlers that best-effort-unlink our
+ *      entry. Crash without firing handlers is fine — the next plugin
+ *      init's sweep handles the orphan.
+ *
+ * All side effects are guarded by `try`: a registry failure must
+ * never prevent the plugin from starting up.
+ */
+export declare function initRegistryForPlugin(input: {
+    serverUrl: URL | string;
+    workdir?: string;
+    agent?: "tui" | "headless";
+    registryDir?: string;
+}): {
+    entry?: RegistryEntry;
+    sweepRemoved: number;
 };
 /**
  * Build the F2a warning block appended to `schedule_job` success output

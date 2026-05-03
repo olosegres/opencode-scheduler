@@ -4,15 +4,18 @@ import { join } from "path"
 import { tmpdir } from "os"
 import {
   type Job,
+  type JobRunSpec,
   deliverLive,
   ensureLiveSession,
   getSessionBusy,
   parseArgs,
   preflight,
   pollUntilIdle,
+  resolveLiveAttachUrl,
   runLive,
   trimBaseUrl,
 } from "./runner"
+import type { RegistryEntry } from "./registry"
 
 interface ServerState {
   busy: Set<string>
@@ -312,5 +315,121 @@ describe("runner against in-process Bun.serve stub", () => {
     state.busy.add(sid)
     const ok = await pollUntilIdle({ baseUrl, sessionId: sid, timeoutSeconds: 1, intervalMs: 100 })
     expect(ok).toBe(false)
+  })
+})
+
+describe("resolveLiveAttachUrl (F5 discovery glue)", () => {
+  const baseJob: Job = { slug: "x", name: "X", workdir: "/proj" }
+
+  const registryEntry = (overrides: Partial<RegistryEntry> = {}): RegistryEntry => ({
+    schemaVersion: 1,
+    pid: 1,
+    port: 4096,
+    url: "http://127.0.0.1:4096/",
+    workdir: "/proj",
+    startedAt: "2026-05-03T10:00:00Z",
+    ...overrides,
+  })
+
+  test("explicit attachUrl on the job: source='job', no discovery call", async () => {
+    let discoverCalled = false
+    const result = await resolveLiveAttachUrl({
+      job: baseJob,
+      run: { attachUrl: "http://example.com:5000", session: "ses_x" } as JobRunSpec,
+      executionPolicy: "prefer-live-server",
+      discover: async () => {
+        discoverCalled = true
+        return undefined
+      },
+    })
+    expect(result).toEqual({ attachUrl: "http://example.com:5000", source: "job" })
+    expect(discoverCalled).toBe(false)
+  })
+
+  test("legacy job.attachUrl is honoured when run.attachUrl is missing", async () => {
+    const result = await resolveLiveAttachUrl({
+      job: { ...baseJob, attachUrl: "http://legacy:4096" } as Job,
+      run: { session: "ses_x" } as JobRunSpec,
+      executionPolicy: "prefer-live-server",
+      discover: async () => undefined,
+    })
+    expect(result.attachUrl).toBe("http://legacy:4096")
+    expect(result.source).toBe("job")
+  })
+
+  test("no attachUrl + sessionId + candidate found → source='registry'", async () => {
+    const result = await resolveLiveAttachUrl({
+      job: baseJob,
+      run: { session: "ses_x" } as JobRunSpec,
+      executionPolicy: "prefer-live-server",
+      discover: async () => registryEntry({ url: "http://127.0.0.1:7777/" }),
+    })
+    expect(result).toEqual({ attachUrl: "http://127.0.0.1:7777/", source: "registry" })
+  })
+
+  test("no attachUrl + sessionId + no candidate → source='none', no fallback URL", async () => {
+    const result = await resolveLiveAttachUrl({
+      job: baseJob,
+      run: { session: "ses_x" } as JobRunSpec,
+      executionPolicy: "prefer-live-server",
+      discover: async () => undefined,
+    })
+    expect(result).toEqual({ attachUrl: undefined, source: "none" })
+  })
+
+  test("headless-only suppresses discovery entirely", async () => {
+    let discoverCalled = false
+    const result = await resolveLiveAttachUrl({
+      job: baseJob,
+      run: { session: "ses_x" } as JobRunSpec,
+      executionPolicy: "headless-only",
+      discover: async () => {
+        discoverCalled = true
+        return registryEntry()
+      },
+    })
+    expect(result.source).toBe("none")
+    expect(discoverCalled).toBe(false)
+  })
+
+  test("missing run.session suppresses discovery (would land in a fresh session anyway)", async () => {
+    let discoverCalled = false
+    const result = await resolveLiveAttachUrl({
+      job: baseJob,
+      run: {} as JobRunSpec,
+      executionPolicy: "prefer-live-server",
+      discover: async () => {
+        discoverCalled = true
+        return registryEntry()
+      },
+    })
+    expect(result.source).toBe("none")
+    expect(discoverCalled).toBe(false)
+  })
+
+  test("discoverer throws → fallback to source='none' (best-effort)", async () => {
+    const result = await resolveLiveAttachUrl({
+      job: baseJob,
+      run: { session: "ses_x" } as JobRunSpec,
+      executionPolicy: "prefer-live-server",
+      discover: async () => {
+        throw new Error("ENOENT")
+      },
+    })
+    expect(result.source).toBe("none")
+  })
+
+  test("workdir from job is forwarded to the discoverer for affinity sort", async () => {
+    let receivedWorkdir: string | undefined
+    await resolveLiveAttachUrl({
+      job: { ...baseJob, workdir: "/specific/proj" } as Job,
+      run: { session: "ses_x" } as JobRunSpec,
+      executionPolicy: "prefer-live-server",
+      discover: async (opts) => {
+        receivedWorkdir = opts.workdir
+        return undefined
+      },
+    })
+    expect(receivedWorkdir).toBe("/specific/proj")
   })
 })

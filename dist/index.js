@@ -12335,30 +12335,97 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // src/index.ts
-import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, unlinkSync } from "fs";
-import { basename, dirname, join, resolve as resolvePath } from "path";
-import { homedir, platform } from "os";
+import { chmodSync, createWriteStream, existsSync as existsSync2, mkdirSync as mkdirSync2, readdirSync as readdirSync2, readFileSync as readFileSync2, renameSync as renameSync2, rmSync, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
+import { basename, dirname, join as join2, resolve as resolvePath } from "path";
+import { homedir as homedir2, platform } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
 import { fileURLToPath } from "url";
-var OPENCODE_CONFIG = join(homedir(), ".config", "opencode");
-var LEGACY_JOBS_DIR = join(OPENCODE_CONFIG, "jobs");
-var LOGS_DIR = join(OPENCODE_CONFIG, "logs");
-var SCHEDULER_DIR = join(OPENCODE_CONFIG, "scheduler");
-var SCOPES_DIR = join(SCHEDULER_DIR, "scopes");
-var SUPERVISOR_PATH = join(SCHEDULER_DIR, "supervisor.pl");
-var SCHEDULER_CONFIG = join(OPENCODE_CONFIG, "opencode-scheduler.json");
+
+// src/registry.ts
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+var REGISTRY_SCHEMA_VERSION = 1;
+function getRuntimeDir() {
+  return process.env.OPENCODE_SCHEDULER_RUNTIME_DIR ?? join(homedir(), ".local", "share", "opencode", "runtime");
+}
+function entryPath(dir, pid) {
+  return join(dir, `${pid}.json`);
+}
+function writeRegistryEntry(entry, dir = getRuntimeDir()) {
+  if (!existsSync(dir))
+    mkdirSync(dir, { recursive: true, mode: 448 });
+  const finalPath = entryPath(dir, entry.pid);
+  const tmpPath = `${finalPath}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmpPath, JSON.stringify(entry), { mode: 384 });
+  renameSync(tmpPath, finalPath);
+  return finalPath;
+}
+function removeRegistryEntry(pid, dir = getRuntimeDir()) {
+  try {
+    unlinkSync(entryPath(dir, pid));
+  } catch {}
+}
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = err.code;
+    return code === "EPERM";
+  }
+}
+function readRegistryEntry(path) {
+  try {
+    const raw = readFileSync(path, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.schemaVersion === REGISTRY_SCHEMA_VERSION && typeof parsed.pid === "number" && typeof parsed.port === "number" && typeof parsed.url === "string" && typeof parsed.workdir === "string" && typeof parsed.startedAt === "string") {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+function sweepStaleEntries(dir = getRuntimeDir()) {
+  if (!existsSync(dir))
+    return { scanned: 0, removed: 0 };
+  const files = readdirSync(dir).filter((file2) => file2.endsWith(".json") && !file2.endsWith(".tmp.json"));
+  let removed = 0;
+  for (const file2 of files) {
+    const path = join(dir, file2);
+    const entry = readRegistryEntry(path);
+    const dead = !entry || !isPidAlive(entry.pid);
+    if (dead) {
+      try {
+        unlinkSync(path);
+        removed += 1;
+      } catch {}
+    }
+  }
+  return { scanned: files.length, removed };
+}
+
+// src/index.ts
+var OPENCODE_CONFIG = join2(homedir2(), ".config", "opencode");
+var LEGACY_JOBS_DIR = join2(OPENCODE_CONFIG, "jobs");
+var LOGS_DIR = join2(OPENCODE_CONFIG, "logs");
+var SCHEDULER_DIR = join2(OPENCODE_CONFIG, "scheduler");
+var SCOPES_DIR = join2(SCHEDULER_DIR, "scopes");
+var SUPERVISOR_PATH = join2(SCHEDULER_DIR, "supervisor.pl");
+var SCHEDULER_CONFIG = join2(OPENCODE_CONFIG, "opencode-scheduler.json");
 var IS_MAC = platform() === "darwin";
 var IS_LINUX = platform() === "linux";
 var IS_WINDOWS = platform() === "win32";
-var LAUNCH_AGENTS_DIR = join(homedir(), "Library", "LaunchAgents");
+var LAUNCH_AGENTS_DIR = join2(homedir2(), "Library", "LaunchAgents");
 var LAUNCHD_PREFIX = "com.opencode.job";
-var SYSTEMD_USER_DIR = join(homedir(), ".config", "systemd", "user");
+var SYSTEMD_USER_DIR = join2(homedir2(), ".config", "systemd", "user");
 var WINDOWS_TASK_ROOT = "\\OpenCode";
 var WINDOWS_TASK_PREFIX = "opencode-job";
 var CRON_MANAGED_PREFIX = "opencode-scheduler";
 function ensureDir(dir) {
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+  if (!existsSync2(dir)) {
+    mkdirSync2(dir, { recursive: true });
   }
 }
 function ensureDirUserOnly(dir) {
@@ -12369,19 +12436,19 @@ function ensureDirUserOnly(dir) {
 }
 function writeFileUserOnly(path, content) {
   const tmp = `${path}.tmp`;
-  writeFileSync(tmp, content);
+  writeFileSync2(tmp, content);
   try {
     chmodSync(tmp, 384);
   } catch {}
   try {
-    renameSync(tmp, path);
+    renameSync2(tmp, path);
   } catch {
-    writeFileSync(path, content);
+    writeFileSync2(path, content);
     try {
       chmodSync(path, 384);
     } catch {}
     try {
-      unlinkSync(tmp);
+      unlinkSync2(tmp);
     } catch {}
   }
 }
@@ -12391,7 +12458,7 @@ function slugify(name) {
 function normalizeWorkdirPath(input) {
   const trimmed = input.trim();
   if (!trimmed)
-    return homedir();
+    return homedir2();
   return resolvePath(trimmed);
 }
 function fnv1a64(input) {
@@ -12414,25 +12481,25 @@ function deriveScopeId(workdir) {
   return `${base}-${suffix}`;
 }
 function scopeDir(scopeId) {
-  return join(SCOPES_DIR, scopeId);
+  return join2(SCOPES_DIR, scopeId);
 }
 function scopeJobsDir(scopeId) {
-  return join(scopeDir(scopeId), "jobs");
+  return join2(scopeDir(scopeId), "jobs");
 }
 function scopeLocksDir(scopeId) {
-  return join(scopeDir(scopeId), "locks");
+  return join2(scopeDir(scopeId), "locks");
 }
 function scopeRunsDir(scopeId) {
-  return join(scopeDir(scopeId), "runs");
+  return join2(scopeDir(scopeId), "runs");
 }
 function scopeLogsDir(scopeId) {
-  return join(LOGS_DIR, "scheduler", scopeId);
+  return join2(LOGS_DIR, "scheduler", scopeId);
 }
 function jobFilePath(scopeId, slug) {
-  return join(scopeJobsDir(scopeId), `${slug}.json`);
+  return join2(scopeJobsDir(scopeId), `${slug}.json`);
 }
 function scopedLogPath(scopeId, slug) {
-  return join(scopeLogsDir(scopeId), `${slug}.log`);
+  return join2(scopeLogsDir(scopeId), `${slug}.log`);
 }
 function currentScopeId() {
   return deriveScopeId(process.cwd());
@@ -12788,20 +12855,20 @@ exit($exit_code);
 `;
 function ensureSupervisorScript() {
   ensureDir(SCHEDULER_DIR);
-  writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT);
+  writeFileSync2(SUPERVISOR_PATH, SUPERVISOR_SCRIPT);
   ensureRunnerScript();
 }
-var RUNNER_PATH = join(SCHEDULER_DIR, "runner.js");
+var RUNNER_PATH = join2(SCHEDULER_DIR, "runner.js");
 function ensureRunnerScript() {
   try {
     const here = dirname(fileURLToPath(import.meta.url));
     const candidates = [
-      join(here, "runner.js"),
-      join(here, "..", "dist", "runner.js")
+      join2(here, "runner.js"),
+      join2(here, "..", "dist", "runner.js")
     ];
     for (const candidate of candidates) {
-      if (existsSync(candidate)) {
-        writeFileSync(RUNNER_PATH, readFileSync(candidate));
+      if (existsSync2(candidate)) {
+        writeFileSync2(RUNNER_PATH, readFileSync2(candidate));
         return;
       }
     }
@@ -12990,6 +13057,14 @@ will use REST against that URL for both session creation
 \`attachUrl\`, all session work goes through the in-process plugin
 client, which does NOT need an open HTTP port.
 
+At fire-time, when the job has no persisted \`attachUrl\`, the runner
+also consults the F5 plugin-side runtime registry
+(\`~/.local/share/opencode/runtime/<pid>.json\`). Every opencode that
+loads this plugin and is reachable externally publishes its own
+entry there, so a sibling TUI launched with \`--port\` can become the
+delivery target automatically \u2014 you only need to pass \`attachUrl\`
+explicitly for cross-host or otherwise non-discoverable targets.
+
 ## Runtime Values: Dates
 
 If you need local dates, compute them at runtime.
@@ -13078,19 +13153,19 @@ function installBuiltinSkill(skill, rootDir, overwrite = false) {
   if (!installRoot) {
     throw new Error("Install directory cannot be empty.");
   }
-  if (!existsSync(installRoot)) {
+  if (!existsSync2(installRoot)) {
     throw new Error(`Directory not found: ${installRoot}`);
   }
   const relativeDir = dirname(skill.suggestedPath);
-  const installDir = join(installRoot, relativeDir);
+  const installDir = join2(installRoot, relativeDir);
   ensureDir(installDir);
   const files = [];
   for (const [filename, content] of Object.entries(skill.files)) {
-    const targetPath = join(installDir, filename);
-    if (existsSync(targetPath) && !overwrite) {
+    const targetPath = join2(installDir, filename);
+    if (existsSync2(targetPath) && !overwrite) {
       throw new Error(`File already exists: ${targetPath} (pass overwrite=true to replace)`);
     }
-    writeFileSync(targetPath, `${content.trimEnd()}
+    writeFileSync2(targetPath, `${content.trimEnd()}
 `);
     files.push(targetPath);
   }
@@ -13101,8 +13176,8 @@ function ensureBestPracticesSkill(workdir) {
   if (Object.keys(skill.files).length !== 1) {
     throw new Error(`ensureBestPracticesSkill assumes a single-file skill; ${skill.name} now has ${Object.keys(skill.files).length} files. Update the presence check before adding more.`);
   }
-  const expectedPath = join(workdir, skill.suggestedPath);
-  if (existsSync(expectedPath)) {
+  const expectedPath = join2(workdir, skill.suggestedPath);
+  if (existsSync2(expectedPath)) {
     return { status: "present", path: expectedPath };
   }
   try {
@@ -13119,8 +13194,8 @@ function ensureBestPracticesSkill(workdir) {
 function loadPackageInfo() {
   const fallback = { name: "opencode-scheduler", version: "unknown" };
   try {
-    const packagePath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-    const raw = readFileSync(packagePath, "utf-8");
+    const packagePath = join2(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const raw = readFileSync2(packagePath, "utf-8");
     const parsed = JSON.parse(raw);
     return {
       name: typeof parsed.name === "string" ? parsed.name : fallback.name,
@@ -13148,10 +13223,10 @@ function findOpencode() {
   const paths = [
     "/opt/homebrew/bin/opencode",
     "/usr/local/bin/opencode",
-    join(homedir(), ".opencode", "bin", "opencode")
+    join2(homedir2(), ".opencode", "bin", "opencode")
   ];
   for (const p of paths) {
-    if (existsSync(p)) {
+    if (existsSync2(p)) {
       return p;
     }
   }
@@ -13356,7 +13431,7 @@ function formatStartTime(hour, minute) {
   return `${pad2(hour)}:${pad2(minute)}`;
 }
 function windowsTaskBaseName(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   return `${WINDOWS_TASK_PREFIX}-${scopeId}-${job.slug}`;
 }
 function windowsTaskName(baseName, index, total) {
@@ -13474,7 +13549,7 @@ function cronToWindowsTaskDefinitions(job) {
   });
 }
 function createLaunchdPlist(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const jobPath = jobFilePath(scopeId, job.slug);
@@ -13493,7 +13568,7 @@ ${renderLaunchdCalendar(calendar)}
     `    <string>${escapePlistString(jobPath)}</string>`
   ].join(`
 `);
-  const workdir = job.workdir || homedir();
+  const workdir = job.workdir || homedir2();
   const enhancedPath = getEnhancedPath();
   const envDict = renderLaunchdEnvDict(job, enhancedPath);
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -13533,47 +13608,47 @@ ${calendarXml}
 function installLaunchdJob(job) {
   ensureDir(LAUNCH_AGENTS_DIR);
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join2(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const plistPath = join(LAUNCH_AGENTS_DIR, `${label}.plist`);
+  const plistPath = join2(LAUNCH_AGENTS_DIR, `${label}.plist`);
   try {
     execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" });
   } catch {}
-  if (existsSync(legacyPlistPath)) {
+  if (existsSync2(legacyPlistPath)) {
     try {
       execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" });
     } catch {}
   }
   const plist = createLaunchdPlist(job);
-  writeFileSync(plistPath, plist);
+  writeFileSync2(plistPath, plist);
   execSync(`launchctl load "${plistPath}"`);
 }
 function uninstallLaunchdJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const scopedPlistPath = join(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
+  const scopedPlistPath = join2(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join2(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
-    if (!existsSync(plistPath))
+    if (!existsSync2(plistPath))
       continue;
     try {
       execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" });
     } catch {}
     try {
-      unlinkSync(plistPath);
+      unlinkSync2(plistPath);
     } catch {}
   }
 }
 function createSystemdService(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const jobPath = jobFilePath(scopeId, job.slug);
-  const workdir = job.workdir || homedir();
+  const workdir = job.workdir || homedir2();
   const enhancedPath = getEnhancedPath();
   const envLines = renderSystemdEnvLines(job, enhancedPath);
   const execStart = ["/usr/bin/perl", SUPERVISOR_PATH, jobPath].map((arg) => `"${escapeSystemdArg(arg)}"`).join(" ");
@@ -13610,23 +13685,23 @@ WantedBy=timers.target
 function installSystemdJob(job) {
   ensureDir(SYSTEMD_USER_DIR);
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
-  const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const servicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const timerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
   try {
     execSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" });
     execSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" });
   } catch {}
-  writeFileSync(servicePath, createSystemdService(job));
-  writeFileSync(timerPath, createSystemdTimer(job));
+  writeFileSync2(servicePath, createSystemdService(job));
+  writeFileSync2(timerPath, createSystemdTimer(job));
   execSync("systemctl --user daemon-reload");
   execSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`);
   execSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`);
 }
 function uninstallSystemdJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   const scopedTimerUnit = `opencode-job-${scopeId}-${job.slug}.timer`;
   const legacyTimerUnit = `opencode-job-${job.slug}.timer`;
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
@@ -13635,14 +13710,14 @@ function uninstallSystemdJob(job) {
       execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
     } catch {}
   }
-  const scopedServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const scopedTimerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
-  const legacyServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
-  const legacyTimerPath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
+  const scopedServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const scopedTimerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const legacyServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
+  const legacyTimerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
   for (const p of [scopedServicePath, scopedTimerPath, legacyServicePath, legacyTimerPath]) {
-    if (existsSync(p)) {
+    if (existsSync2(p)) {
       try {
-        unlinkSync(p);
+        unlinkSync2(p);
       } catch {}
     }
   }
@@ -13704,7 +13779,7 @@ function isCronAvailable() {
   return isCommandAvailable("crontab");
 }
 function cronBlockId(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   return `${scopeId}:${job.slug}`;
 }
 function cronLegacyBlockId(job) {
@@ -13777,7 +13852,7 @@ function stripManagedCronBlocks(content, blockIds) {
   };
 }
 function createCronEntry(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   const jobPath = jobFilePath(scopeId, job.slug);
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const escapedSupervisor = shellEscapeDoubleQuoted(SUPERVISOR_PATH);
@@ -13791,7 +13866,7 @@ function installCronJob(job) {
     throw new Error("cron backend is unavailable: `crontab` command not found.");
   }
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
   const blockId = cronBlockId(job);
@@ -13875,20 +13950,20 @@ function ensureScopeStorage(scopeId) {
 function loadScopedJob(scopeId, slug) {
   ensureScopeStorage(scopeId);
   const path = jobFilePath(scopeId, slug);
-  if (!existsSync(path))
+  if (!existsSync2(path))
     return null;
   try {
-    return normalizeJob(JSON.parse(readFileSync(path, "utf-8")));
+    return normalizeJob(JSON.parse(readFileSync2(path, "utf-8")));
   } catch {
     return null;
   }
 }
 function loadAllScopedJobs(scopeId) {
   ensureScopeStorage(scopeId);
-  const files = readdirSync(scopeJobsDir(scopeId)).filter((f) => f.endsWith(".json"));
+  const files = readdirSync2(scopeJobsDir(scopeId)).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync(join(scopeJobsDir(scopeId), f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync2(join2(scopeJobsDir(scopeId), f), "utf-8")));
     } catch {
       return null;
     }
@@ -13897,9 +13972,9 @@ function loadAllScopedJobs(scopeId) {
 function listScopeIds() {
   ensureDir(SCOPES_DIR);
   try {
-    return readdirSync(SCOPES_DIR).filter((name) => {
+    return readdirSync2(SCOPES_DIR).filter((name) => {
       try {
-        return existsSync(scopeDir(name));
+        return existsSync2(scopeDir(name));
       } catch {
         return false;
       }
@@ -13918,55 +13993,55 @@ function loadAllJobsAcrossScopes() {
 }
 function loadLegacyJob(slug) {
   ensureDir(LEGACY_JOBS_DIR);
-  const path = join(LEGACY_JOBS_DIR, `${slug}.json`);
-  if (!existsSync(path))
+  const path = join2(LEGACY_JOBS_DIR, `${slug}.json`);
+  if (!existsSync2(path))
     return null;
   try {
-    return normalizeJob(JSON.parse(readFileSync(path, "utf-8")));
+    return normalizeJob(JSON.parse(readFileSync2(path, "utf-8")));
   } catch {
     return null;
   }
 }
 function loadAllLegacyJobs() {
   ensureDir(LEGACY_JOBS_DIR);
-  const files = readdirSync(LEGACY_JOBS_DIR).filter((f) => f.endsWith(".json"));
+  const files = readdirSync2(LEGACY_JOBS_DIR).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync(join(LEGACY_JOBS_DIR, f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync2(join2(LEGACY_JOBS_DIR, f), "utf-8")));
     } catch {
       return null;
     }
   }).filter(Boolean);
 }
 function saveJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   const normalizedJob = { ...job, scopeId };
   ensureScopeStorage(scopeId);
   const path = jobFilePath(scopeId, normalizedJob.slug);
   writeFileUserOnly(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2));
 }
 function deleteJobFile(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   const path = jobFilePath(scopeId, job.slug);
-  if (existsSync(path)) {
-    unlinkSync(path);
+  if (existsSync2(path)) {
+    unlinkSync2(path);
   }
 }
 function listDirectoryFiles(dir, options) {
-  if (!existsSync(dir))
+  if (!existsSync2(dir))
     return [];
   try {
-    const entries = readdirSync(dir, { withFileTypes: true });
-    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join(dir, name)).sort();
+    const entries = readdirSync2(dir, { withFileTypes: true });
+    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join2(dir, name)).sort();
   } catch {
     return [];
   }
 }
 function listDirectoryNames(dir) {
-  if (!existsSync(dir))
+  if (!existsSync2(dir))
     return [];
   try {
-    return readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    return readdirSync2(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
   } catch {
     return [];
   }
@@ -13979,9 +14054,9 @@ function buildGlobalCleanupPlan(includeHistory) {
   const scopedJobDefinitionPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeJobsDir(scopeId), { suffix: ".json" }));
   const lockPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeLocksDir(scopeId), { suffix: ".json" }));
   const runHistoryPaths = includeHistory ? scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeRunsDir(scopeId), { suffix: ".jsonl" })) : [];
-  const schedulerLogsRoot = join(LOGS_DIR, "scheduler");
+  const schedulerLogsRoot = join2(LOGS_DIR, "scheduler");
   const logScopeIds = listDirectoryNames(schedulerLogsRoot);
-  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
+  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join2(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
   const launchdPaths = IS_MAC ? listDirectoryFiles(LAUNCH_AGENTS_DIR, { prefix: `${LAUNCHD_PREFIX}.`, suffix: ".plist" }) : [];
   const systemdPaths = IS_LINUX ? [
     ...listDirectoryFiles(SYSTEMD_USER_DIR, { prefix: "opencode-job-", suffix: ".service" }),
@@ -14003,7 +14078,7 @@ function buildGlobalCleanupPlan(includeHistory) {
 function removePaths(paths, errors3) {
   const removed = [];
   for (const path of uniquePaths(paths)) {
-    if (!existsSync(path))
+    if (!existsSync2(path))
       continue;
     try {
       rmSync(path, { recursive: true, force: true });
@@ -14030,7 +14105,7 @@ function executeGlobalCleanup(plan, options) {
   }
   const removeOrPreview = (paths) => {
     if (dryRun)
-      return uniquePaths(paths).filter((path) => existsSync(path));
+      return uniquePaths(paths).filter((path) => existsSync2(path));
     return removePaths(paths, errors3);
   };
   const removed = {
@@ -14198,6 +14273,59 @@ function resolveEffectiveAttachUrl(input) {
     internalWarning: false
   };
 }
+function buildOwnRegistryEntry(input) {
+  if (isInternalServerUrl(input.serverUrl))
+    return;
+  const url2 = typeof input.serverUrl === "string" ? new URL(input.serverUrl) : input.serverUrl;
+  const portStr = url2.port || (url2.protocol === "https:" ? "443" : "80");
+  const port = Number.parseInt(portStr, 10);
+  if (!Number.isFinite(port) || port < 0)
+    return;
+  return {
+    schemaVersion: REGISTRY_SCHEMA_VERSION,
+    pid: input.pid ?? process.pid,
+    port,
+    url: url2.toString(),
+    workdir: input.workdir ?? process.cwd(),
+    startedAt: input.startedAt ?? new Date().toISOString(),
+    agent: input.agent
+  };
+}
+function initRegistryForPlugin(input) {
+  let sweepRemoved = 0;
+  try {
+    sweepRemoved = sweepStaleEntries(input.registryDir).removed;
+  } catch {}
+  const entry = buildOwnRegistryEntry({
+    serverUrl: input.serverUrl,
+    workdir: input.workdir,
+    agent: input.agent
+  });
+  if (!entry)
+    return { sweepRemoved };
+  try {
+    writeRegistryEntry(entry, input.registryDir ?? undefined);
+  } catch {
+    return { sweepRemoved };
+  }
+  if (!REGISTRY_EXIT_HANDLERS_INSTALLED.has(entry.pid)) {
+    REGISTRY_EXIT_HANDLERS_INSTALLED.add(entry.pid);
+    const cleanup = () => {
+      try {
+        removeRegistryEntry(entry.pid, input.registryDir ?? undefined);
+      } catch {}
+    };
+    process.once("exit", cleanup);
+    const signalHandler = (signal) => {
+      cleanup();
+      process.kill(process.pid, signal);
+    };
+    process.once("SIGINT", signalHandler);
+    process.once("SIGTERM", signalHandler);
+  }
+  return { entry, sweepRemoved };
+}
+var REGISTRY_EXIT_HANDLERS_INSTALLED = new Set;
 function buildInternalServerWarning() {
   return [
     "WARNING: this opencode is running without an external HTTP port (serverUrl is http://opencode.internal/...).",
@@ -14363,7 +14491,7 @@ function sanitizeJob(job) {
     sanitized.scopeId = trimmed ? trimmed : undefined;
   }
   if (!sanitized.scopeId) {
-    sanitized.scopeId = deriveScopeId(sanitized.workdir || homedir());
+    sanitized.scopeId = deriveScopeId(sanitized.workdir || homedir2());
   }
   if (sanitized.timeoutSeconds !== undefined) {
     const n = sanitized.timeoutSeconds;
@@ -14540,7 +14668,7 @@ function findJobByName(name, options) {
   return job;
 }
 function updateJobRecord(job, updates) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   const latest = loadScopedJob(scopeId, job.slug) || job;
   const updated = {
     ...latest,
@@ -14552,7 +14680,7 @@ function updateJobRecord(job, updates) {
   return updated;
 }
 function getLogPath(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
   return scopedLogPath(scopeId, job.slug);
 }
 function buildOpencodeArgs(job, options) {
@@ -14636,10 +14764,10 @@ function buildRunEnvironment() {
   };
 }
 function loadSchedulerConfig() {
-  if (!existsSync(SCHEDULER_CONFIG))
+  if (!existsSync2(SCHEDULER_CONFIG))
     return {};
   try {
-    const raw = readFileSync(SCHEDULER_CONFIG, "utf-8");
+    const raw = readFileSync2(SCHEDULER_CONFIG, "utf-8");
     const parsed = JSON.parse(raw);
     if (!isRecord(parsed))
       return {};
@@ -14684,11 +14812,11 @@ function getOpencodeVersion(opencodePath) {
 }
 function runJobNow(job) {
   ensureDir(LOGS_DIR);
-  ensureDir(scopeLogsDir(job.scopeId || deriveScopeId(job.workdir || homedir())));
+  ensureDir(scopeLogsDir(job.scopeId || deriveScopeId(job.workdir || homedir2())));
   const startedAt = new Date().toISOString();
   const logPath = getLogPath(job);
   const logStream = createWriteStream(logPath, { flags: "a" });
-  const workdir = job.workdir || homedir();
+  const workdir = job.workdir || homedir2();
   logStream.write(`
 === Manual run ${startedAt} ===
 `);
@@ -14788,7 +14916,7 @@ function formatJobDetails(job) {
     `Job: ${job.name}`,
     `Slug: ${job.slug}`,
     `Schedule: ${job.schedule} (${describeCron(job.schedule)})`,
-    `Working Directory: ${job.workdir || homedir()}`
+    `Working Directory: ${job.workdir || homedir2()}`
   ];
   const run = (() => {
     try {
@@ -14873,7 +15001,7 @@ function formatJobDetails(job) {
 }
 function getJobLogs(job, options) {
   const logPath = getLogPath(job);
-  if (!existsSync(logPath))
+  if (!existsSync2(logPath))
     return null;
   const maxChars = options?.maxChars ?? 5000;
   const tailLines = options?.tailLines;
@@ -14886,14 +15014,14 @@ function getJobLogs(job, options) {
         }).toString();
         return output.length > maxChars ? output.slice(-maxChars) : output;
       } catch {
-        const content2 = readFileSync(logPath, "utf-8");
+        const content2 = readFileSync2(logPath, "utf-8");
         const lines = content2.split(/\r?\n/);
         const output = lines.slice(-clampedLines).join(`
 `);
         return output.length > maxChars ? output.slice(-maxChars) : output;
       }
     }
-    const content = readFileSync(logPath, "utf-8");
+    const content = readFileSync2(logPath, "utf-8");
     return content.length > maxChars ? content.slice(-maxChars) : content;
   } catch {
     return null;
@@ -14956,6 +15084,10 @@ async function verifySessionExists(input) {
   }
 }
 var SchedulerPlugin = async ({ client, serverUrl }) => {
+  initRegistryForPlugin({
+    serverUrl,
+    agent: process.stdout.isTTY ? "tui" : "headless"
+  });
   return {
     tool: {
       schedule_job: tool({
@@ -15538,8 +15670,8 @@ ${content.trim()}
             return errorResult(format, `Failed to build invocation: ${msg}`);
           }
           try {
-            const oldScopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
-            const nextScopeId = updatedJob.scopeId || deriveScopeId(updatedJob.workdir || homedir());
+            const oldScopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+            const nextScopeId = updatedJob.scopeId || deriveScopeId(updatedJob.workdir || homedir2());
             const scopeChanged = oldScopeId !== nextScopeId;
             if (scopeChanged) {
               uninstallJob(job);
@@ -15548,9 +15680,9 @@ ${content.trim()}
             installJob(updatedJob);
             if (scopeChanged) {
               const oldPath = jobFilePath(oldScopeId, job.slug);
-              if (existsSync(oldPath)) {
+              if (existsSync2(oldPath)) {
                 try {
-                  unlinkSync(oldPath);
+                  unlinkSync2(oldPath);
                 } catch {}
               }
             }
@@ -15587,10 +15719,10 @@ ${content.trim()}
           }
           uninstallJob(job);
           deleteJobFile(job);
-          const legacyPath = join(LEGACY_JOBS_DIR, `${job.slug}.json`);
-          if (existsSync(legacyPath)) {
+          const legacyPath = join2(LEGACY_JOBS_DIR, `${job.slug}.json`);
+          if (existsSync2(legacyPath)) {
             try {
-              unlinkSync(legacyPath);
+              unlinkSync2(legacyPath);
             } catch {}
           }
           return okResult(format, `Deleted job "${job.name}"`, { job });

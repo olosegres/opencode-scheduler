@@ -72,7 +72,7 @@ Jobs run from the working directory where you created them, picking up your `ope
 
 ### Live HTTP delivery (live runner)
 
-When a job is scheduled with `attachUrl` pointing at a reachable opencode server, the supervisor runs a small **runner** (`runner.js`) that delivers the prompt over HTTP instead of spawning a second `opencode run` process:
+When a job has a reachable opencode server, the supervisor runs a small **runner** (`runner.js`) that delivers the prompt over HTTP instead of spawning a second `opencode run` process:
 
 - preflight `/global/health` + `/session/<id>` (1.5s timeout)
 - if the session is busy and `deliveryPolicy='execute'` (default), wait up to `timeoutSeconds` for it to go idle, then deliver
@@ -80,7 +80,13 @@ When a job is scheduled with `attachUrl` pointing at a reachable opencode server
 - on any HTTP/network failure (exit 10), the supervisor falls back to the headless `opencode run` invocation captured at schedule-time
 - contract errors (session 404 etc.; exit 11) abort without falling back
 
-Each fire-time attempt appends a structured record to `~/.config/opencode/scheduler/scopes/<scope>/runs/<slug>.jsonl` (delivery, attachUrl, sessionId, httpStatus, error, durationMs).
+How `attachUrl` is resolved at fire-time:
+
+1. **Explicit `attachUrl` on the job** (passed at `schedule_job` time, or auto-detected from the host opencode's `serverUrl` when launched with `--port` — see F2b in the plan) wins immediately.
+2. **F5 plugin-side runtime registry**: every opencode that loads this plugin and is reachable externally publishes `~/.local/share/opencode/runtime/<pid>.json` (`schemaVersion: 1`, pid, port, url, workdir, startedAt). The runner reads the directory at fire-time, filters by `kill(pid, 0)` and a 200 from `GET /session/<sid>`, sorts by `startedAt` desc with workdir affinity, and uses the best candidate's URL — so jobs scheduled without an `attachUrl` arg still deliver live as long as a sibling opencode is up.
+3. **Nothing matches** → exit 10 → headless `opencode run` fallback.
+
+Each fire-time attempt appends a structured record to `~/.config/opencode/scheduler/scopes/<scope>/runs/<slug>.jsonl` (delivery, `attachUrl`, `attachUrlSource: 'job' | 'registry'`, sessionId, httpStatus, error, durationMs).
 
 ### Session policies
 
@@ -97,8 +103,8 @@ Each fire-time attempt appends a structured record to `~/.config/opencode/schedu
 
 `executionPolicy` controls live-vs-headless preference:
 
-- `prefer-live-server` (default) — try live HTTP if `attachUrl` set, fall back to headless on failure.
-- `headless-only` — never attempt live HTTP. Mutually exclusive with `attachUrl`.
+- `prefer-live-server` (default) — try live HTTP if `attachUrl` is set OR the F5 registry surfaces a live opencode that sees the session; fall back to headless on failure.
+- `headless-only` — never attempt live HTTP. Mutually exclusive with `attachUrl` and skips F5 discovery entirely.
 
 `deliveryPolicy` controls busy handling on live delivery:
 

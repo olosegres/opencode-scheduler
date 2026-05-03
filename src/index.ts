@@ -19,6 +19,13 @@ import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
+import {
+  REGISTRY_SCHEMA_VERSION,
+  removeRegistryEntry,
+  sweepStaleEntries,
+  writeRegistryEntry,
+  type RegistryEntry,
+} from "./registry"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -941,6 +948,14 @@ will use REST against that URL for both session creation
 (\`new-per-job\`) and verification (\`current\` / \`existing\`). Without
 \`attachUrl\`, all session work goes through the in-process plugin
 client, which does NOT need an open HTTP port.
+
+At fire-time, when the job has no persisted \`attachUrl\`, the runner
+also consults the F5 plugin-side runtime registry
+(\`~/.local/share/opencode/runtime/<pid>.json\`). Every opencode that
+loads this plugin and is reachable externally publishes its own
+entry there, so a sibling TUI launched with \`--port\` can become the
+delivery target automatically — you only need to pass \`attachUrl\`
+explicitly for cross-host or otherwise non-discoverable targets.
 
 ## Runtime Values: Dates
 
@@ -2605,6 +2620,116 @@ export function resolveEffectiveAttachUrl(input: {
 }
 
 /**
+ * Derive the registry entry for the calling opencode process from
+ * the plugin's `serverUrl` input. Returns `undefined` for the
+ * in-process IPC sentinel (`http://opencode.internal/...`) — those
+ * entries would be useless to any external reader.
+ *
+ * Exported so plugin init can stay declarative and so the helper is
+ * unit-testable without spinning up the full plugin runtime.
+ */
+export function buildOwnRegistryEntry(input: {
+  serverUrl: URL | string
+  pid?: number
+  workdir?: string
+  startedAt?: string
+  agent?: "tui" | "headless"
+}): RegistryEntry | undefined {
+  if (isInternalServerUrl(input.serverUrl)) return undefined
+
+  const url = typeof input.serverUrl === "string" ? new URL(input.serverUrl) : input.serverUrl
+  const portStr = url.port || (url.protocol === "https:" ? "443" : "80")
+  const port = Number.parseInt(portStr, 10)
+  if (!Number.isFinite(port) || port < 0) return undefined
+
+  return {
+    schemaVersion: REGISTRY_SCHEMA_VERSION,
+    pid: input.pid ?? process.pid,
+    port,
+    url: url.toString(),
+    workdir: input.workdir ?? process.cwd(),
+    startedAt: input.startedAt ?? new Date().toISOString(),
+    agent: input.agent,
+  }
+}
+
+/**
+ * Wire up F5 plugin-side bookkeeping for one opencode process:
+ *
+ *   1. Sweep stale entries left behind by previously-crashed
+ *      processes (cheap O(N) on every plugin init).
+ *   2. If the calling opencode is reachable externally (i.e. NOT the
+ *      in-process IPC sentinel), publish our own `<pid>.json` so the
+ *      scheduler runner can discover us at fire-time.
+ *   3. Register one-shot exit handlers that best-effort-unlink our
+ *      entry. Crash without firing handlers is fine — the next plugin
+ *      init's sweep handles the orphan.
+ *
+ * All side effects are guarded by `try`: a registry failure must
+ * never prevent the plugin from starting up.
+ */
+export function initRegistryForPlugin(input: {
+  serverUrl: URL | string
+  workdir?: string
+  agent?: "tui" | "headless"
+  registryDir?: string
+}): { entry?: RegistryEntry; sweepRemoved: number } {
+  let sweepRemoved = 0
+  try {
+    sweepRemoved = sweepStaleEntries(input.registryDir).removed
+  } catch {
+    // never block startup on a sweep failure
+  }
+
+  const entry = buildOwnRegistryEntry({
+    serverUrl: input.serverUrl,
+    workdir: input.workdir,
+    agent: input.agent,
+  })
+  if (!entry) return { sweepRemoved }
+
+  try {
+    writeRegistryEntry(entry, input.registryDir ?? undefined)
+  } catch {
+    // unwriteable runtime dir — the next install / sweep will retry;
+    // discovery just won't see us this run
+    return { sweepRemoved }
+  }
+
+  // Register exit handlers exactly once per process.
+  if (!REGISTRY_EXIT_HANDLERS_INSTALLED.has(entry.pid)) {
+    REGISTRY_EXIT_HANDLERS_INSTALLED.add(entry.pid)
+    const cleanup = (): void => {
+      try {
+        removeRegistryEntry(entry.pid, input.registryDir ?? undefined)
+      } catch {
+        // best-effort; sweep handles leftovers
+      }
+    }
+    process.once("exit", cleanup)
+    // SIGINT / SIGTERM handlers re-emit the signal so we don't change
+    // process exit semantics (pending listeners still see it, default
+    // exit code is preserved).
+    const signalHandler = (signal: NodeJS.Signals) => {
+      cleanup()
+      process.kill(process.pid, signal)
+    }
+    process.once("SIGINT", signalHandler)
+    process.once("SIGTERM", signalHandler)
+  }
+
+  return { entry, sweepRemoved }
+}
+
+/**
+ * Tracks pids that already had exit handlers installed in this
+ * process. Defends against pathological cases where the plugin gets
+ * initialized twice (multiple Plugin entries pointing at the same
+ * bundle — unlikely but cheap to guard against).
+ */
+const REGISTRY_EXIT_HANDLERS_INSTALLED = new Set<number>()
+
+/**
  * Build the F2a warning block appended to `schedule_job` success output
  * when the host opencode is in-process-only and live delivery into the
  * calling TUI is impossible.
@@ -3616,6 +3741,14 @@ async function verifySessionExists(input: { baseUrl: string; sessionId: string }
 // === PLUGIN ===
 
 export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
+  // F5: publish our own runtime entry (when externally reachable) and
+  // sweep entries left behind by previously-crashed opencode processes.
+  // Side-effect-isolated; init failures never block plugin startup.
+  initRegistryForPlugin({
+    serverUrl,
+    agent: process.stdout.isTTY ? "tui" : "headless",
+  })
+
   return {
     tool: {
        schedule_job: tool({

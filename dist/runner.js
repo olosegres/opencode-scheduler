@@ -1,7 +1,80 @@
 // src/runner.ts
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from "fs";
-import { dirname, join } from "path";
+import { appendFileSync, chmodSync, existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2 } from "fs";
+import { dirname, join as join2 } from "path";
+import { homedir as homedir2 } from "os";
+
+// src/registry.ts
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
+import { join } from "path";
+var REGISTRY_SCHEMA_VERSION = 1;
+function getRuntimeDir() {
+  return process.env.OPENCODE_SCHEDULER_RUNTIME_DIR ?? join(homedir(), ".local", "share", "opencode", "runtime");
+}
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = err.code;
+    return code === "EPERM";
+  }
+}
+function readRegistryEntry(path) {
+  try {
+    const raw = readFileSync(path, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.schemaVersion === REGISTRY_SCHEMA_VERSION && typeof parsed.pid === "number" && typeof parsed.port === "number" && typeof parsed.url === "string" && typeof parsed.workdir === "string" && typeof parsed.startedAt === "string") {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+function listRegistryEntries(dir = getRuntimeDir()) {
+  if (!existsSync(dir))
+    return [];
+  return readdirSync(dir).filter((file) => file.endsWith(".json") && !file.endsWith(".tmp.json")).map((file) => readRegistryEntry(join(dir, file))).filter((entry) => entry !== null);
+}
+async function fetchWithTimeout(url, init, timeoutMs, fetchImpl = fetch) {
+  const controller = new AbortController;
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+async function discoverLiveOpencode(opts) {
+  const dir = opts.dir ?? getRuntimeDir();
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const timeoutMs = opts.perCandidateTimeoutMs ?? 1500;
+  const aliveCandidates = listRegistryEntries(dir).filter((entry) => isPidAlive(entry.pid));
+  if (aliveCandidates.length === 0)
+    return;
+  aliveCandidates.sort((a, b) => a.startedAt < b.startedAt ? 1 : -1);
+  if (opts.workdir) {
+    const target = opts.workdir;
+    aliveCandidates.sort((a, b) => {
+      const aMatch = a.workdir === target ? 0 : 1;
+      const bMatch = b.workdir === target ? 0 : 1;
+      return aMatch - bMatch;
+    });
+  }
+  for (const candidate of aliveCandidates) {
+    const baseUrl = candidate.url.replace(/\/+$/, "");
+    const probeUrl = `${baseUrl}/session/${encodeURIComponent(opts.sessionId)}`;
+    try {
+      const res = await fetchWithTimeout(probeUrl, { method: "GET" }, timeoutMs, fetchImpl);
+      if (res.ok)
+        return candidate;
+    } catch {}
+  }
+  return;
+}
+
+// src/runner.ts
 var SCHEDULED_PERMS = [
   { permission: "question", action: "deny", pattern: "*" },
   { permission: "plan_enter", action: "deny", pattern: "*" },
@@ -28,7 +101,7 @@ function parseArgs(argv) {
   return { jobPath, timeoutSeconds };
 }
 function readJob(jobPath) {
-  const raw = readFileSync(jobPath, "utf-8");
+  const raw = readFileSync2(jobPath, "utf-8");
   return JSON.parse(raw);
 }
 function getJobRun(job) {
@@ -38,19 +111,19 @@ function getJobRun(job) {
 }
 function runsJsonlPath(job) {
   const scope = job.scopeId ?? "default";
-  const dir = join(homedir(), ".config", "opencode", "scheduler", "scopes", scope, "runs");
-  return join(dir, `${job.slug}.jsonl`);
+  const dir = join2(homedir2(), ".config", "opencode", "scheduler", "scopes", scope, "runs");
+  return join2(dir, `${job.slug}.jsonl`);
 }
 function appendRunRecord(job, record) {
   const path = runsJsonlPath(job);
   const dir = dirname(path);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+  if (!existsSync2(dir)) {
+    mkdirSync2(dir, { recursive: true });
     try {
       chmodSync(dir, 448);
     } catch {}
   }
-  const isNew = !existsSync(path);
+  const isNew = !existsSync2(path);
   appendFileSync(path, JSON.stringify(record) + `
 `);
   if (isNew) {
@@ -63,15 +136,6 @@ function newRunId() {
   const seconds = Math.floor(Date.now() / 1000);
   const random = Math.floor(Math.random() * 1e9).toString().padStart(9, "0");
   return `${seconds}-${random}`;
-}
-async function fetchWithTimeout(url, init, timeoutMs) {
-  const controller = new AbortController;
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(id);
-  }
 }
 function trimBaseUrl(url) {
   return url.replace(/\/+$/, "");
@@ -174,6 +238,7 @@ async function runLive(input) {
   const t0 = Date.now();
   const runId = newRunId();
   const timestamp = new Date().toISOString();
+  const attachUrlSource = input.attachUrlSource ?? "job";
   const pre = await preflight({ baseUrl, sessionId: input.sessionId });
   if (pre === "no-server") {
     return {
@@ -183,6 +248,7 @@ async function runLive(input) {
         timestamp,
         delivery: "live",
         attachUrl: baseUrl,
+        attachUrlSource,
         sessionId: input.sessionId,
         error: "preflight: server unreachable",
         durationMs: Date.now() - t0,
@@ -198,6 +264,7 @@ async function runLive(input) {
         timestamp,
         delivery: "live",
         attachUrl: baseUrl,
+        attachUrlSource,
         sessionId: input.sessionId,
         error: "preflight: session not found",
         durationMs: Date.now() - t0,
@@ -227,6 +294,7 @@ async function runLive(input) {
             timestamp,
             delivery: "live",
             attachUrl: baseUrl,
+            attachUrlSource,
             sessionId,
             error: "session busy beyond timeout",
             durationMs: Date.now() - t0,
@@ -253,6 +321,7 @@ async function runLive(input) {
         timestamp,
         delivery: "live",
         attachUrl: baseUrl,
+        attachUrlSource,
         sessionId,
         httpStatus,
         durationMs: Date.now() - t0,
@@ -268,6 +337,7 @@ async function runLive(input) {
         timestamp,
         delivery: "live",
         attachUrl: baseUrl,
+        attachUrlSource,
         sessionId,
         error: msg,
         durationMs: Date.now() - t0,
@@ -275,6 +345,24 @@ async function runLive(input) {
       }
     };
   }
+}
+async function resolveLiveAttachUrl(input) {
+  const direct = input.run.attachUrl ?? input.job.attachUrl;
+  if (direct)
+    return { attachUrl: direct, source: "job" };
+  if (input.executionPolicy === "headless-only" || !input.run.session) {
+    return { attachUrl: undefined, source: "none" };
+  }
+  const discover = input.discover ?? discoverLiveOpencode;
+  try {
+    const candidate = await discover({
+      sessionId: input.run.session,
+      workdir: input.job.workdir
+    });
+    if (candidate)
+      return { attachUrl: candidate.url, source: "registry" };
+  } catch {}
+  return { attachUrl: undefined, source: "none" };
 }
 async function main() {
   let args;
@@ -296,10 +384,11 @@ async function main() {
     return 64;
   }
   const run = getJobRun(job);
-  const attachUrl = run.attachUrl ?? job.attachUrl;
   const executionPolicy = job.executionPolicy ?? "prefer-live-server";
   const deliveryPolicy = job.deliveryPolicy ?? "execute";
   const timeoutSeconds = args.timeoutSeconds ?? job.timeoutSeconds ?? 60;
+  const resolved = await resolveLiveAttachUrl({ job, run, executionPolicy });
+  const attachUrl = resolved.attachUrl;
   if (!attachUrl || executionPolicy === "headless-only") {
     const record = {
       runId: newRunId(),
@@ -307,7 +396,7 @@ async function main() {
       delivery: "live",
       attachUrl: attachUrl ? trimBaseUrl(attachUrl) : undefined,
       sessionId: run.session,
-      error: !attachUrl ? "no attachUrl on job; live delivery impossible" : "executionPolicy='headless-only'",
+      error: !attachUrl ? "no attachUrl on job; live delivery impossible (F5 discovery found no live opencode that sees this session)" : "executionPolicy='headless-only'",
       durationMs: 0,
       exitCode: 10
     };
@@ -329,9 +418,11 @@ async function main() {
     appendRunRecord(job, record);
     return 11;
   }
+  const attachUrlSource = resolved.source === "registry" ? "registry" : "job";
   const result = await runLive({
     job,
     attachUrl,
+    attachUrlSource,
     sessionId: run.session,
     prompt,
     files: run.files ?? [],
@@ -356,6 +447,7 @@ if (invokedDirectly) {
 export {
   trimBaseUrl,
   runLive,
+  resolveLiveAttachUrl,
   preflight,
   pollUntilIdle,
   parseArgs,
