@@ -169,6 +169,24 @@ interface Job {
     lastRunSource?: "manual" | "scheduled";
     lastRunStatus?: "running" | "success" | "failed";
 }
+/**
+ * Idempotently ensure the scheduled-job-best-practices skill exists in
+ * `workdir/.opencode/skill/`. Called by `schedule_job` so a freshly-cloned
+ * project (or one that never installed the skill) gets a copy on first
+ * job creation, without making the user run install_skill manually.
+ *
+ * - 'present'   → SKILL.md already exists; do not overwrite (user may
+ *                 have local edits; updates flow via explicit install_skill
+ *                 with overwrite=true).
+ * - 'installed' → wrote it now.
+ * - 'failed'    → could not write (logged as a non-fatal note; job creation
+ *                 still proceeds because the skill is a soft dependency).
+ */
+export declare function ensureBestPracticesSkill(workdir: string): {
+    status: "present" | "installed" | "failed";
+    path: string;
+    reason?: string;
+};
 export declare function getEnhancedPath(options?: {
     withTerminalPath?: boolean;
 }): string;

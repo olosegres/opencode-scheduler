@@ -13094,6 +13094,26 @@ function installBuiltinSkill(skill, rootDir, overwrite = false) {
   }
   return { directory: installDir, files };
 }
+function ensureBestPracticesSkill(workdir) {
+  const skill = SCHEDULED_JOB_BEST_PRACTICES_SKILL;
+  if (Object.keys(skill.files).length !== 1) {
+    throw new Error(`ensureBestPracticesSkill assumes a single-file skill; ${skill.name} now has ${Object.keys(skill.files).length} files. Update the presence check before adding more.`);
+  }
+  const expectedPath = join(workdir, skill.suggestedPath);
+  if (existsSync(expectedPath)) {
+    return { status: "present", path: expectedPath };
+  }
+  try {
+    installBuiltinSkill(skill, workdir, false);
+    return { status: "installed", path: expectedPath };
+  } catch (error45) {
+    return {
+      status: "failed",
+      path: expectedPath,
+      reason: error45 instanceof Error ? error45.message : String(error45)
+    };
+  }
+}
 function loadPackageInfo() {
   const fallback = { name: "opencode-scheduler", version: "unknown" };
   try {
@@ -14855,7 +14875,21 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
   return {
     tool: {
       schedule_job: tool({
-        description: "Schedule a recurring job to run an opencode prompt. Uses launchd (Mac), systemd (Linux), Windows Task Scheduler, or cron fallback when needed.",
+        description: [
+          "Create a NEW recurring scheduled job that fires an opencode prompt on a cron schedule.",
+          "Trigger phrases: 'schedule', 'every day/hour/Monday at', 'recurring', 'daily', 'weekly',",
+          "'automate', 'set up a cron', 'run X every N hours', 'background task on a timer'.",
+          "Persists to an OS-level scheduler entry that survives reboots and runs whether opencode",
+          "is open or not (this is NOT an in-process timer).",
+          "NOT for one-off 'run this now' \u2014 use run_job. NOT for editing an existing job \u2014 use update_job.",
+          "Choose sessionPolicy: 'current' (default; continues this chat), 'new-per-job' (independent",
+          "long-running task with its own thread), 'new-per-run' (stateless, fresh thread per fire),",
+          "'existing' (user supplied an explicit sessionId). Pass attachUrl when a live opencode",
+          "server is reachable for live HTTP delivery instead of spawning a headless CLI.",
+          "Auto-installs the scheduled-job-best-practices skill into the workdir if not already",
+          "present (idempotent; existing files are left untouched), so scheduled prompts can",
+          "reference it via @scheduled-job-best-practices without a separate install_skill call."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("A short name for the job (e.g. 'standing desk search')"),
           schedule: tool.schema.string().describe("Cron expression: '0 9 * * *' (daily 9am), '0 */6 * * *' (every 6h), '30 8 * * 1' (Monday 8:30am)"),
@@ -14887,6 +14921,7 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
           const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name);
           const workdir = normalizeWorkdirPath(args.workdir || process.cwd());
           const scopeId = deriveScopeId(workdir);
+          const skillEnsure = ensureBestPracticesSkill(workdir);
           if (loadScopedJob(scopeId, slug)) {
             return errorResult(format, `Job "${slug}" already exists in this workspace scope (${scopeId}). Delete it first or use a different name.`);
           }
@@ -15058,19 +15093,22 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
             const primaryLine = run.command ? `Command: ${run.command}${run.arguments ? ` ${run.arguments}` : ""}` : `Prompt: ${(run.prompt ?? "").slice(0, 100)}${(run.prompt ?? "").length > 100 ? "..." : ""}`;
             const attachLine = run.attachUrl ? `Attach URL: ${run.attachUrl}
 ` : "";
+            const skillLine = skillEnsure.status === "installed" ? `
+Installed scheduled-job-best-practices skill at ${skillEnsure.path}` : skillEnsure.status === "failed" ? `
+Note: could not install scheduled-job-best-practices skill (${skillEnsure.reason}); add it manually with install_skill` : "";
             return okResult(format, `Scheduled "${args.name}"
 
 Schedule: ${args.schedule} (${describeCron(args.schedule)})
 Platform: ${platformName}
 Working Directory: ${workdir}
-${attachLine}${primaryLine}
+${attachLine}${primaryLine}${skillLine}
 
 ${reliabilityLine}
 
 Commands:
 - "run ${args.name} now" - run immediately
 - "show my jobs" - list all
-- "delete job ${args.name}" - remove`, { job });
+- "delete job ${args.name}" - remove`, { job, skill: skillEnsure });
           } catch (error45) {
             deleteJobFile(job);
             const msg = error45 instanceof Error ? error45.message : String(error45);
@@ -15079,7 +15117,14 @@ Commands:
         }
       }),
       list_jobs: tool({
-        description: "List all scheduled jobs. Optionally filter by source app.",
+        description: [
+          "List existing scheduled jobs in the current project workdir (or across all projects with",
+          "allScopes=true). Trigger phrases: 'what jobs do I have', 'show my schedules', 'list cron',",
+          "'any active scheduled tasks', 'what's scheduled', 'show scheduler jobs'.",
+          "Read-only and cheap. Use this BEFORE update_job / delete_job / run_job / get_job / job_logs",
+          "when the user refers to a job by description rather than exact slug, so you can resolve",
+          "the right slug. Returns name, slug, schedule, last run status, and sessionPolicy per job."
+        ].join(" "),
         args: {
           source: tool.schema.string().optional().describe("Filter by source app (e.g. 'marketplace')"),
           allScopes: tool.schema.boolean().optional().describe("List jobs across all scopes."),
@@ -15126,7 +15171,12 @@ ${lines.join(`
         }
       }),
       get_version: tool({
-        description: "Show the scheduler plugin version and opencode binary info.",
+        description: [
+          "Report the opencode-scheduler plugin version and the resolved opencode binary path/version.",
+          "Trigger phrases: 'what version', 'is the scheduler installed', 'which opencode is being used',",
+          "'show plugin version', 'debug scheduler setup'. Read-only. Use before troubleshooting to",
+          "confirm which plugin build is loaded and which opencode executable will run scheduled jobs."
+        ].join(" "),
         args: {
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
         },
@@ -15149,7 +15199,15 @@ ${lines.join(`
         }
       }),
       get_skill: tool({
-        description: "Get built-in skill templates to copy into your project.",
+        description: [
+          "Return the source text of a built-in skill template without writing it to disk.",
+          "Currently bundles 'scheduled-job-best-practices' (sessionPolicy / delivery / env parity /",
+          "auto-permissions / runtime date snippets / idempotency patterns).",
+          "Trigger phrases: 'show the skill', 'what does the best-practices skill contain', 'preview",
+          "the scheduler skill', 'how should I write a scheduled prompt'. Read-only.",
+          "To actually install the skill into the repo (.opencode/skill/<name>/SKILL.md) use install_skill.",
+          "Read this BEFORE writing a non-trivial scheduled prompt to follow the documented patterns."
+        ].join(" "),
         args: {
           name: tool.schema.string().optional().describe("Skill name (default: scheduled-job-best-practices)"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
@@ -15181,7 +15239,14 @@ ${content.trim()}
         }
       }),
       install_skill: tool({
-        description: "Install a built-in skill into your repo's .opencode/skill directory.",
+        description: [
+          "Write a built-in skill template into .opencode/skill/<name>/SKILL.md in the current repo so",
+          "scheduled prompts can reference it via @<name>.",
+          "Trigger phrases: 'install the skill', 'add the best-practices skill to my project',",
+          "'set up scheduled-job-best-practices', 'I want to @-reference the skill in my prompt'.",
+          "Mutates repo files (creates a directory + writes SKILL.md). Idempotent overwrite.",
+          "Use get_skill first if the user only wants to read the template without writing it."
+        ].join(" "),
         args: {
           name: tool.schema.string().optional().describe("Skill name (default: scheduled-job-best-practices)"),
           directory: tool.schema.string().optional().describe("Repo root directory to install into (defaults to current directory)."),
@@ -15221,7 +15286,14 @@ ${content.trim()}
         }
       }),
       get_job: tool({
-        description: "Get details for a scheduled job",
+        description: [
+          "Fetch full metadata for ONE scheduled job by name or slug: cron schedule, prompt, sessionPolicy,",
+          "attachUrl, env mode, last run timestamp, last run status, exit code, log path.",
+          "Trigger phrases: 'show details for X', 'what does the X job do', 'when did X last run',",
+          "'inspect job', 'what's the schedule for X', 'show config for X job'.",
+          "Read-only. Use BEFORE update_job to know the current values, or after run_job to confirm",
+          "lastRun fields. If the user refers to the job vaguely, run list_jobs first to resolve the slug."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
@@ -15236,7 +15308,15 @@ ${content.trim()}
         }
       }),
       update_job: tool({
-        description: "Update a scheduled job",
+        description: [
+          "Modify fields on an EXISTING scheduled job: cron schedule, prompt, sessionPolicy / sessionId,",
+          "executionPolicy, deliveryPolicy, attachUrl, timeoutSeconds, model, agent, files.",
+          "Trigger phrases: 'change', 'update', 'edit', 'move X to 10am', 'change schedule', 'switch X",
+          "to a different model', 'point job at this attachUrl', 'add files to job'.",
+          "Reinstalls the OS scheduler entry (launchd / systemd / Task Scheduler / cron line) \u2014 safe to",
+          "re-run on the same job. Requires the job to already exist. Run list_jobs / get_job first if",
+          "the slug is ambiguous. NOT for creating a new job \u2014 use schedule_job."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           schedule: tool.schema.string().optional().describe("Updated cron expression"),
@@ -15384,7 +15464,15 @@ ${content.trim()}
         }
       }),
       delete_job: tool({
-        description: "Delete a scheduled job",
+        description: [
+          "Remove a single scheduled job: deletes the job definition AND uninstalls its OS scheduler",
+          "entry (launchd plist / systemd unit / Task Scheduler task / cron line). Logs are kept.",
+          "Trigger phrases: 'delete X', 'remove the X job', 'stop the X schedule', 'cancel scheduled X',",
+          "'unschedule X', 'kill the cron for X'.",
+          "Single job only. For wiping ALL jobs across all projects use cleanup_global. Destructive: the",
+          "schedule will not fire again. Recreate via schedule_job if needed. Resolve slug via list_jobs",
+          "if the user is vague."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug to delete"),
           format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
@@ -15407,7 +15495,15 @@ ${content.trim()}
         }
       }),
       cleanup_global: tool({
-        description: "Clean up scheduler artifacts globally across all scopes. Removes job definitions everywhere; optionally remove logs and run history.",
+        description: [
+          "GLOBAL nuke of scheduler artifacts across ALL projects on this machine: every job definition,",
+          "every OS scheduler entry, every lock file. Optionally also logs and run history.",
+          "Trigger phrases: 'clean up everything', 'reset the scheduler', 'wipe all scheduled jobs',",
+          "'remove all cron entries created by the plugin', 'global cleanup', 'nuke scheduler state'.",
+          "DESTRUCTIVE and IRREVERSIBLE. Always defaults to dry-run; pass confirm:true to actually",
+          "delete. Reports counts grouped by location. NEVER call without explicit user intent \u2014 for",
+          "removing one job use delete_job instead. Affects every workdir/scope, not just the current one."
+        ].join(" "),
         args: {
           includeHistory: tool.schema.boolean().optional().describe("Also remove run history and logs across all scopes (default false)."),
           confirm: tool.schema.boolean().optional().describe("Set true to execute deletion. Default is dry run with no destructive changes."),
@@ -15431,7 +15527,15 @@ ${content.trim()}
         }
       }),
       run_job: tool({
-        description: "Run a scheduled job immediately",
+        description: [
+          "Fire an existing scheduled job ONCE immediately, outside its cron schedule. Fire-and-forget.",
+          "Trigger phrases: 'run X now', 'trigger', 'test the job', 'execute X manually', 'fire it now',",
+          "'kick off X', 'run job out of band', 'check if it works'.",
+          "Does NOT change the cron schedule or any job config. Output appends to the same log file as",
+          "scheduled runs (read with job_logs). Useful for testing a freshly created or updated job",
+          "without waiting for its next scheduled tick. NOT for creating a new job \u2014 use schedule_job.",
+          "Resolve slug via list_jobs if needed."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           prompt: tool.schema.string().optional().describe("Override prompt for this run"),
@@ -15524,7 +15628,13 @@ Logs: ${runResult.logPath}${attachHint}${logSection}`, {
         }
       }),
       job_logs: tool({
-        description: "View the latest logs from a scheduled job",
+        description: [
+          "Show the most recent stdout/stderr from a scheduled job's log file (last N lines, default tail).",
+          "Trigger phrases: 'show logs for X', 'did X run', 'why did X fail', 'debug job', 'what",
+          "happened with X', 'tail the scheduler log', 'check job output', 'last run output'.",
+          "Read-only. Use after run_job to inspect the immediate result, or when get_job shows",
+          "lastRunStatus=failed to find the cause. Returns raw supervised process output."
+        ].join(" "),
         args: {
           name: tool.schema.string().describe("The job name or slug"),
           lines: tool.schema.number().optional().describe("Number of lines from the end of the log (default 200)."),

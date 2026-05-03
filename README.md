@@ -317,19 +317,23 @@ Update the standing-desk job to use attachUrl http://localhost:4096
 
 ### Built-in Skill Templates
 
-To install the built-in skill into your project (no copy/paste), open OpenCode in your repo and run:
+`schedule_job` auto-installs `scheduled-job-best-practices` into `<workdir>/.opencode/skill/` on first use. The check is idempotent: existing `SKILL.md` is left untouched (so any local edits survive). After that you can reference it from a scheduled prompt:
+
+```
+@scheduled-job-best-practices
+
+(your task here)
+```
+
+Force a fresh copy (overwrite local edits) or pre-seed before scheduling:
 
 ```
 Install the scheduled job best practices skill
 ```
 
-This calls the plugin’s `install_skill` tool and writes `.opencode/skill/scheduled-job-best-practices/SKILL.md`.
+This calls the plugin’s `install_skill` tool. Pass `overwrite=true` if a previous version is already present and you want it replaced.
 
-(If you prefer, you can also say: `Get skill from opencode-scheduler and add it to my skills`.)
-
-Then add `@scheduled-job-best-practices` at the top of scheduled job prompts.
-
-(Manual option: use `get_skill` to fetch `scheduled-job-best-practices` and copy it into `.opencode/skill/scheduled-job-best-practices/SKILL.md`.)
+(Manual option: use `get_skill` to read the template and copy it into `.opencode/skill/scheduled-job-best-practices/SKILL.md` yourself.)
 
 ## Troubleshooting
 
