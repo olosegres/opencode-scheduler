@@ -13,7 +13,7 @@
  */
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
+import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
@@ -51,6 +51,60 @@ const CRON_MANAGED_PREFIX = "opencode-scheduler"
 function ensureDir(dir: string) {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })
+  }
+}
+
+/**
+ * Ensure a directory exists with user-only (0700) permissions. Use for
+ * directories that store secret-bearing files (scheduler scopes, log dirs
+ * that may include env-leaking text, etc.). On Linux some distros default
+ * `~` to 0755, so the parent dir alone doesn't protect children.
+ *
+ * `chmodSync` is a no-op on Windows (fs ignores the mode bits) — that's
+ * fine; Windows storage isolation is handled by the user profile, not
+ * POSIX modes.
+ */
+function ensureDirUserOnly(dir: string): void {
+  ensureDir(dir)
+  try {
+    chmodSync(dir, 0o700)
+  } catch {
+    // Best-effort: if chmod fails (e.g. read-only filesystem in tests),
+    // continue. The directory still exists and the file-level chmod is
+    // the primary protection.
+  }
+}
+
+/**
+ * Atomically write a file with user-only (0600) permissions. Use for any
+ * file that may contain secrets (job.json with env.snapshot, runner.js
+ * if it ever embedded secrets — currently it doesn't).
+ *
+ * Atomicity: write to <path>.tmp, then rename. Avoids partial reads if
+ * another process is reading the file while supervisor.pl is updating
+ * lastRun fields.
+ */
+function writeFileUserOnly(path: string, content: string): void {
+  const tmp = `${path}.tmp`
+  writeFileSync(tmp, content)
+  try {
+    chmodSync(tmp, 0o600)
+  } catch {
+    // see ensureDirUserOnly comment
+  }
+  // rename is atomic on POSIX same-filesystem; Node handles cross-FS
+  // transparently (falls back to copy+unlink internally).
+  try {
+    renameSync(tmp, path)
+  } catch {
+    // Fallback: write directly (loses atomicity but preserves correctness).
+    writeFileSync(path, content)
+    try {
+      chmodSync(path, 0o600)
+    } catch {}
+    try {
+      unlinkSync(tmp)
+    } catch {}
   }
 }
 
@@ -157,6 +211,9 @@ sub write_json_atomic {
   open my $fh, ">", $tmp or die "Failed to write $tmp: $!\n";
   print $fh $json->encode($data);
   close $fh or die "Failed to close $tmp: $!\n";
+  # 0600 — job files contain env.snapshot which may include secrets.
+  # rename preserves the source perms, so we chmod the temp first.
+  chmod 0600, $tmp;
   rename $tmp, $path or die "Failed to rename $tmp -> $path: $!\n";
 }
 
@@ -233,6 +290,28 @@ delete $job->{lastRunError};
 $job->{updatedAt} = $started_at;
 write_json_atomic($job_path, $job);
 
+# Merge per-job env snapshot into %ENV before scheduler-only overrides.
+# Snapshot wins over launchd/systemd-provided env; scheduler-only keys
+# (OPENCODE_PERMISSION, OPENCODE_SCHEDULER_RUN_ID) wins over snapshot.
+#
+# Legacy jobs without job.env get a one-line warning printed into the
+# log; they fall back to whatever env launchd/systemd handed us, which
+# is just PATH for jobs created with v1.3.x.
+if (!$job->{env} || ref($job->{env}) ne 'HASH') {
+  print "[opencode-scheduler] WARN: job has no env snapshot (created with v1.3.x); ",
+        "recreate the job to capture the full terminal env.\\n";
+} else {
+  # The mode (snapshot/minimal/login-shell) was already applied at capture
+  # time when env.snapshot was populated — supervisor only has to merge
+  # whatever is already there. login-shell wrap is in job.invocation.
+  my $snap = $job->{env}->{snapshot};
+  if ($snap && ref($snap) eq 'HASH') {
+    for my $k (keys %$snap) {
+      $ENV{$k} = $snap->{$k};
+    }
+  }
+}
+
 # Force non-interactive scheduled runs
 my $perm = { question => "deny" };
 if ($ENV{OPENCODE_PERMISSION}) {
@@ -262,6 +341,70 @@ my $command = $inv->{command};
 my @args = @{ $inv->{args} };
 
 my $workdir = $job->{workdir} || $home;
+
+# === Runner-first delivery (S5) ===
+#
+# When the job has a live-delivery target (attachUrl) and runs aren't
+# explicitly headless-only, try the bundled runner first. It performs
+# health/idle/busy preflight + HTTP prompt_async; on exit 10 we fall
+# through to the headless invocation.
+#
+# Resolution rules:
+#   - Look for runner at <plugin>/dist/runner.js
+#   - The runner path is recorded via OPENCODE_SCHEDULER_RUNNER_PATH if
+#     present (set by the plugin at install time); otherwise we probe a
+#     conventional location in ~/.config/opencode/scheduler/runner.js.
+my $runner_path = $ENV{OPENCODE_SCHEDULER_RUNNER_PATH} || "$home/.config/opencode/scheduler/runner.js";
+my $execution_policy = $job->{executionPolicy} || "prefer-live-server";
+my $live_target = "";
+if ($job->{run} && ref($job->{run}) eq 'HASH' && $job->{run}->{attachUrl}) {
+  $live_target = $job->{run}->{attachUrl};
+} elsif ($job->{attachUrl}) {
+  $live_target = $job->{attachUrl};
+}
+
+my $tried_live = 0;
+my $live_exit = -1;
+if ($live_target && $execution_policy ne "headless-only" && -f $runner_path) {
+  $tried_live = 1;
+  print "\n=== runner: live delivery attempt to $live_target ===\n";
+  my @runner_cmd = ("/usr/bin/env", "node", $runner_path, "--job", $job_path);
+  if ($job->{timeoutSeconds}) {
+    push @runner_cmd, "--timeout-seconds", $job->{timeoutSeconds};
+  }
+  my $rc = system(@runner_cmd);
+  $live_exit = ($rc == -1) ? 10 : ($rc >> 8);
+  if ($live_exit == 0) {
+    my $now = iso_now();
+    print "\n=== runner: live delivery success $now ===\n";
+    $job->{lastRunStatus} = "success";
+    $job->{lastRunExitCode} = 0;
+    $job->{updatedAt} = $now;
+    write_json_atomic($job_path, $job);
+    unlink $lock_path;
+    exit 0;
+  }
+  if ($live_exit == 11) {
+    my $now = iso_now();
+    print "\n=== runner: contract error (exit 11) $now; not falling back ===\n";
+    $job->{lastRunStatus} = "failed";
+    $job->{lastRunExitCode} = 11;
+    $job->{lastRunError} = "runner contract error";
+    $job->{updatedAt} = $now;
+    write_json_atomic($job_path, $job);
+    unlink $lock_path;
+    exit 11;
+  }
+  print "\n=== runner: live delivery failed (exit $live_exit); falling back to headless ===\n";
+
+  # Use headlessInvocation if present so we don't pass --attach again.
+  if ($job->{headlessInvocation} && ref($job->{headlessInvocation}) eq 'HASH'
+      && $job->{headlessInvocation}->{command}
+      && ref($job->{headlessInvocation}->{args}) eq 'ARRAY') {
+    $command = $job->{headlessInvocation}->{command};
+    @args = @{ $job->{headlessInvocation}->{args} };
+  }
+}
 
 my $timeout = $job->{timeoutSeconds};
 $timeout = undef if defined($timeout) && $timeout !~ /^\\d+$/;
@@ -353,20 +496,170 @@ exit($exit_code);
 function ensureSupervisorScript(): void {
   ensureDir(SCHEDULER_DIR)
   writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT)
+  ensureRunnerScript()
+}
+
+const RUNNER_PATH = join(SCHEDULER_DIR, "runner.js")
+
+/**
+ * Copy the bundled `dist/runner.js` to a stable location under
+ * `~/.config/opencode/scheduler/runner.js`. Supervisor invokes it via
+ * a fixed path so backend entries (plist, systemd, cron) don't have to
+ * embed the plugin's install-time path. Silently no-ops if the bundle
+ * isn't present (e.g. dev mode without a build).
+ */
+function ensureRunnerScript(): void {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const candidates = [
+      join(here, "runner.js"), // built dist/runner.js sits next to dist/index.js
+      join(here, "..", "dist", "runner.js"), // when import.meta is src/index.ts in dev
+    ]
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) {
+        writeFileSync(RUNNER_PATH, readFileSync(candidate))
+        return
+      }
+    }
+  } catch {
+    // Non-fatal: live delivery will be a no-op and supervisor will
+    // fall through to the headless invocation as if the runner failed.
+  }
 }
 
 // Job type
 
 type OpencodeRunFormat = "default" | "json"
 
+type SchedulerEnvMode = "snapshot" | "minimal" | "login-shell"
+
+/**
+ * Scheduler-level env config (read from
+ * `~/.config/opencode/opencode-scheduler.json`).
+ *
+ * `mode`     — default 'snapshot' (capture full process.env minus denylist).
+ *              'minimal' = only PATH/HOME/USER/SHELL.
+ *              'login-shell' = wrap invocation in `$SHELL -lic ...` (S3).
+ * `exclude`  — extends the scheduler-internal denylist for additional keys
+ *              the user does not want baked into job env.
+ * `set`      — explicit overrides applied after the snapshot.
+ *
+ * Legacy keys `preserve` / `preserveOpencodeEnv` are accepted for
+ * back-compat but ignored with a one-shot warn-log on first read.
+ */
 type SchedulerEnvConfig = {
-  preserve?: string[]
+  mode?: SchedulerEnvMode
+  exclude?: string[]
   set?: Record<string, string>
+  /** @deprecated legacy v1.3 allowlist; ignored as of v1.4 */
+  preserve?: string[]
+  /** @deprecated legacy v1.3 toggle; ignored as of v1.4 */
   preserveOpencodeEnv?: boolean
 }
 
 type SchedulerConfig = {
   env?: SchedulerEnvConfig
+}
+
+/**
+ * Per-job env snapshot persisted alongside the job. Captured at
+ * schedule-time so the OS scheduler runs with the same env as the
+ * terminal where it was scheduled (PATH, MCP tokens, plugin secrets,
+ * locale, OPENCODE_*).
+ *
+ * Trust boundary: snapshot may contain secrets (API keys, MCP tokens).
+ * Files are user-only — see README "Env behavior".
+ */
+type JobEnv = {
+  mode: SchedulerEnvMode
+  snapshot?: Record<string, string>
+}
+
+/**
+ * Scheduler-internal env keys that must NEVER appear in a job's snapshot.
+ * Supervisor sets the OPENCODE_* keys per-run; the shell-internal keys
+ * (PWD/OLDPWD/SHLVL/_) are not portable across processes anyway.
+ */
+const ENV_DENYLIST_INTERNAL: ReadonlySet<string> = new Set([
+  "OPENCODE_PERMISSION",
+  "OPENCODE_SCHEDULER_RUN_ID",
+  "OLDPWD",
+  "PWD",
+  "SHLVL",
+  "_",
+])
+
+const ENV_MINIMAL_KEYS: readonly string[] = ["PATH", "HOME", "USER", "SHELL"]
+
+let warnedLegacyEnvKeys = false
+
+function warnLegacyEnvKeysOnce(keys: string[]): void {
+  if (warnedLegacyEnvKeys) return
+  warnedLegacyEnvKeys = true
+  console.warn(
+    `[opencode-scheduler] config keys [${keys.join(", ")}] are deprecated and ignored as of v1.4. ` +
+      `Use env.mode = 'snapshot' | 'minimal' | 'login-shell' and env.exclude / env.set instead.`
+  )
+}
+
+/**
+ * Build a denylist combining scheduler-internal keys and the user's
+ * `env.exclude` extension.
+ */
+function buildEnvDenylist(extra?: string[]): Set<string> {
+  const denylist = new Set(ENV_DENYLIST_INTERNAL)
+  for (const key of extra ?? []) {
+    const trimmed = key.trim()
+    if (trimmed) denylist.add(trimmed)
+  }
+  return denylist
+}
+
+/**
+ * Capture the current process env as a job-level snapshot.
+ *
+ * `mode='snapshot'` — copy of process.env minus the denylist; final overrides
+ *                     applied from `set`.
+ * `mode='minimal'`  — only PATH/HOME/USER/SHELL plus `set` overrides.
+ * `mode='login-shell'` — same snapshot as 'snapshot'; the wrapping is applied
+ *                        at invocation time (S3), not here.
+ */
+export function captureJobEnv(config?: SchedulerEnvConfig): JobEnv {
+  const mode: SchedulerEnvMode = config?.mode ?? "snapshot"
+  const denylist = buildEnvDenylist(config?.exclude)
+  const snapshot: Record<string, string> = {}
+
+  if (mode === "minimal") {
+    for (const key of ENV_MINIMAL_KEYS) {
+      const value = process.env[key]
+      if (typeof value === "string" && value.length > 0) {
+        snapshot[key] = value
+      }
+    }
+  } else {
+    for (const [key, value] of Object.entries(process.env)) {
+      if (denylist.has(key)) continue
+      if (typeof value !== "string") continue
+      snapshot[key] = value
+    }
+  }
+
+  // Apply explicit `set` overrides last; reject denylist keys.
+  for (const [key, value] of Object.entries(config?.set ?? {})) {
+    if (denylist.has(key)) continue
+    snapshot[key] = String(value)
+  }
+
+  // PATH is special: it is the bootstrap-critical key needed for
+  // /usr/bin/env to resolve node/perl/etc. We guarantee it is present
+  // even if the caller put "PATH" in `exclude` or used mode='minimal'
+  // with no PATH in process.env. Document this invariant — `exclude`
+  // does NOT apply to PATH.
+  if (!snapshot.PATH) {
+    snapshot.PATH = getEnhancedPath({ withTerminalPath: true })
+  }
+
+  return { mode, snapshot }
 }
 
 interface JobRunSpec {
@@ -387,6 +680,56 @@ interface JobRunSpec {
   attachUrl?: string
   port?: number
 }
+
+/**
+ * How the scheduler chooses the target opencode session for a job.
+ *
+ * - `current`     — write into the session that called `schedule_job`.
+ *                   Default when run from inside an opencode session.
+ * - `existing`    — write into a session id the user supplies explicitly.
+ * - `new-per-job` — create one dedicated session at schedule-time,
+ *                   reuse it for every run.
+ * - `new-per-run` — create a fresh session every time the job fires.
+ */
+type SessionPolicy = "current" | "existing" | "new-per-job" | "new-per-run"
+
+/**
+ * Where the scheduler tries to deliver the prompt at fire-time.
+ *
+ * - `prefer-live-server` — try live HTTP delivery first, fall back to
+ *                          headless `opencode run` if no server reachable.
+ * - `headless-only`      — never attempt live HTTP; always spawn a CLI.
+ */
+type ExecutionPolicy = "prefer-live-server" | "headless-only"
+
+/**
+ * What the scheduler does when the target session is busy at fire-time.
+ *
+ * - `execute`        — wait up to job.timeoutSeconds, then deliver. If
+ *                      still busy, fail the run (next scheduled fire
+ *                      tries again).
+ * - `leave-message`  — deliver immediately with `noReply: true` so the
+ *                      message lands in the session for the user/agent
+ *                      to pick up later.
+ */
+type DeliveryPolicy = "execute" | "leave-message"
+
+/**
+ * Permission ruleset applied to sessions created by the scheduler.
+ * Mirrors `opencode-fork/packages/opencode/src/cli/cmd/run.ts:353-369`
+ * so scheduled sessions behave like `opencode run` sessions: no
+ * questions, no plan toggling.
+ *
+ * NOT applied to sessions chosen via `current` or `existing` — there
+ * is no public PATCH route to mutate an existing session's permission.
+ * Users who want strict no-questions pick `new-per-job` / `new-per-run`.
+ */
+type ScheduledPermissionRule = { permission: string; action: "deny"; pattern: string }
+const SCHEDULED_PERMS: readonly ScheduledPermissionRule[] = [
+  { permission: "question", action: "deny", pattern: "*" },
+  { permission: "plan_enter", action: "deny", pattern: "*" },
+  { permission: "plan_exit", action: "deny", pattern: "*" },
+]
 
 type JobInvocation = {
   command: string
@@ -412,6 +755,32 @@ interface Job {
   // Snapshot of the command line the OS scheduler should execute.
   // This keeps scheduled runs stable even if run/prompt is updated.
   invocation?: JobInvocation
+
+  /**
+   * Per-job env snapshot persisted at schedule-time. Supervisor merges
+   * `env.snapshot` into the run env before scheduler-only keys
+   * (OPENCODE_PERMISSION, OPENCODE_SCHEDULER_RUN_ID).
+   *
+   * Legacy jobs without this field fall back to mode='minimal' at
+   * supervisor time with a one-line warning to recreate the job.
+   */
+  env?: JobEnv
+
+  /**
+   * Headless-mode invocation snapshot, built at schedule-time without
+   * `--attach`. Used by the runner as the fallback path when live HTTP
+   * delivery fails (S5).
+   */
+  headlessInvocation?: JobInvocation
+
+  /**
+   * Persisted session policy chosen at schedule-time. The runner uses
+   * this at fire-time to decide whether to create a new session
+   * (`new-per-run`) or use the persisted `run.session`.
+   */
+  sessionPolicy?: SessionPolicy
+  executionPolicy?: ExecutionPolicy
+  deliveryPolicy?: DeliveryPolicy
 
   // Reliability knobs (optional)
   timeoutSeconds?: number
@@ -625,9 +994,11 @@ function findOpencode(): string {
 
   // Prefer PATH resolution so the scheduler uses the same `opencode` as the user.
   // This fixes cases where an old install exists at ~/.opencode/bin/opencode.
+  // findOpencode's invariant: fallback paths come first; terminal PATH only as
+  // a last resort. Hence withTerminalPath: false here.
   try {
     const resolved = execSync("command -v opencode", {
-      env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
+      env: { ...process.env, PATH: getEnhancedPath({ withTerminalPath: false }) + ":" + (process.env.PATH ?? "") },
       stdio: ["ignore", "pipe", "ignore"],
     })
       .toString()
@@ -659,9 +1030,19 @@ function findOpencode(): string {
   return "opencode" // hope it's in PATH
 }
 
-// Get PATH that includes common locations for node/npx
-function getEnhancedPath(): string {
-  const paths = [
+// Get PATH that includes common locations for node/npx.
+//
+// `withTerminalPath: true` (default) prepends the current process.env.PATH
+// (i.e. the terminal PATH where the scheduler was invoked) before the
+// hardcoded fallback list. This is what OS scheduler entries should use,
+// because the user's terminal PATH typically carries NVM/asdf/mise/Volta/Bun
+// shims that the static fallback misses.
+//
+// `withTerminalPath: false` returns only the static fallback list. Useful
+// for `findOpencode()` whose explicit invariant is "fallback first, terminal
+// PATH only as the very last resort".
+export function getEnhancedPath(options?: { withTerminalPath?: boolean }): string {
+  const fallback = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
@@ -669,7 +1050,17 @@ function getEnhancedPath(): string {
     "/usr/sbin",
     "/sbin",
   ]
-  return paths.join(":")
+  const withTerminal = options?.withTerminalPath !== false
+  const terminal = withTerminal ? (process.env.PATH ?? "").split(":").filter(Boolean) : []
+  const seen = new Set<string>()
+  const merged: string[] = []
+  for (const entry of [...terminal, ...fallback]) {
+    if (!entry) continue
+    if (seen.has(entry)) continue
+    seen.add(entry)
+    merged.push(entry)
+  }
+  return merged.join(":")
 }
 
 function splitCronExpression(cron: string): [string, string, string, string, string] {
@@ -800,6 +1191,77 @@ function escapePlistString(value: string): string {
 
 function escapeSystemdArg(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+}
+
+/**
+ * Bootstrap-only env keys that must be present in the OS-scheduler entry
+ * itself (launchd plist / systemd unit / cron line) so that:
+ *
+ *   1. `/usr/bin/env node` can locate `node` (PATH).
+ *   2. `/usr/bin/perl` finds `$HOME` for log paths.
+ *   3. supervisor.pl reports the user identity correctly (USER, SHELL).
+ *
+ * Everything else lives in `job.env.snapshot` (the per-job JSON file)
+ * and is merged into `%ENV` by supervisor.pl before exec'ing the actual
+ * command. This keeps unit files / cron lines small (cron has a
+ * historical line-length limit on some impls), avoids redundancy, and
+ * makes job.json the single source of truth for runtime env.
+ */
+const ENV_BOOTSTRAP_KEYS: readonly string[] = ["PATH", "HOME", "USER", "SHELL"]
+
+/**
+ * Pick the bootstrap-env subset from a job's snapshot, with PATH
+ * overridden by the caller-supplied terminal-first PATH. Falls back to
+ * `process.env` for missing keys (covers legacy jobs without snapshot).
+ */
+export function pickBootstrapEnv(job: Job, terminalPath: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  const snapshot = job.env?.snapshot
+  for (const key of ENV_BOOTSTRAP_KEYS) {
+    const fromSnap = snapshot?.[key]
+    const fromProc = process.env[key]
+    const value = fromSnap ?? fromProc
+    if (typeof value === "string" && value.length > 0) {
+      out[key] = value
+    }
+  }
+  out.PATH = terminalPath // always the terminal-first PATH
+  return out
+}
+
+/**
+ * Build the EnvironmentVariables dict for a launchd plist (bootstrap-only).
+ */
+function renderLaunchdEnvDict(job: Job, terminalPath: string): string {
+  const entries = pickBootstrapEnv(job, terminalPath)
+  return Object.keys(entries)
+    .sort()
+    .map((key) => `    <key>${escapePlistString(key)}</key>\n    <string>${escapePlistString(entries[key] ?? "")}</string>`)
+    .join("\n")
+}
+
+/**
+ * Build `Environment="K=V"` lines for a systemd service (bootstrap-only).
+ */
+function renderSystemdEnvLines(job: Job, terminalPath: string): string {
+  const entries = pickBootstrapEnv(job, terminalPath)
+  return Object.keys(entries)
+    .sort()
+    .map((key) => `Environment="${escapeSystemdArg(key)}=${escapeSystemdArg(entries[key] ?? "")}"`)
+    .join("\n")
+}
+
+/**
+ * Inline `K1="V1" K2="V2" ...` env preamble for a cron line (bootstrap-only).
+ * Keeping this minimal protects against historical 1KB cron line-length
+ * limits on some implementations (vixie-cron).
+ */
+function renderCronEnvPreamble(job: Job, terminalPath: string): string {
+  const entries = pickBootstrapEnv(job, terminalPath)
+  return Object.keys(entries)
+    .sort()
+    .map((key) => `${key}="${shellEscapeDoubleQuoted(entries[key] ?? "")}"`)
+    .join(" ")
 }
 
 function renderLaunchdCalendar(calendar: Record<string, number>): string {
@@ -1057,6 +1519,7 @@ function createLaunchdPlist(job: Job): string {
   // Use workdir if specified, otherwise default to home directory
   const workdir = job.workdir || homedir()
   const enhancedPath = getEnhancedPath()
+  const envDict = renderLaunchdEnvDict(job, enhancedPath)
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1070,8 +1533,7 @@ function createLaunchdPlist(job: Job): string {
   
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>${enhancedPath}</string>
+${envDict}
   </dict>
   
   <key>ProgramArguments</key>
@@ -1156,6 +1618,7 @@ function createSystemdService(job: Job): string {
   const jobPath = jobFilePath(scopeId, job.slug)
   const workdir = job.workdir || homedir()
   const enhancedPath = getEnhancedPath()
+  const envLines = renderSystemdEnvLines(job, enhancedPath)
 
   const execStart = ["/usr/bin/perl", SUPERVISOR_PATH, jobPath]
     .map((arg) => `"${escapeSystemdArg(arg)}"`)
@@ -1167,7 +1630,7 @@ Description=OpenCode Job: ${job.name}
 [Service]
 Type=oneshot
 WorkingDirectory=${workdir}
-Environment="PATH=${enhancedPath}"
+${envLines}
 ExecStart=${execStart}
 StandardOutput=append:${logFilePath}
 StandardError=append:${logFilePath}
@@ -1407,9 +1870,9 @@ function createCronEntry(job: Job): string {
   const escapedSupervisor = shellEscapeDoubleQuoted(SUPERVISOR_PATH)
   const escapedJobPath = shellEscapeDoubleQuoted(jobPath)
   const escapedLogPath = shellEscapeDoubleQuoted(logFilePath)
-  const escapedPath = shellEscapeDoubleQuoted(getEnhancedPath())
+  const envPreamble = renderCronEnvPreamble(job, getEnhancedPath())
 
-  return `${job.schedule} PATH="${escapedPath}" /usr/bin/perl "${escapedSupervisor}" "${escapedJobPath}" >> "${escapedLogPath}" 2>&1`
+  return `${job.schedule} ${envPreamble} /usr/bin/perl "${escapedSupervisor}" "${escapedJobPath}" >> "${escapedLogPath}" 2>&1`
 }
 
 function installCronJob(job: Job): void {
@@ -1501,11 +1964,15 @@ function uninstallJob(job: Job): void {
 // === JOB STORAGE ===
 
 function ensureScopeStorage(scopeId: string): void {
+  // jobs/ directory holds files containing env snapshots with secrets;
+  // tighten to 0700. Other dirs (runs/locks/logs) are also tightened —
+  // run JSONL records contain sessionIds which are sensitive enough to
+  // not want world-readable on a multi-user host.
   ensureDir(SCHEDULER_DIR)
   ensureDir(SCOPES_DIR)
-  ensureDir(scopeJobsDir(scopeId))
-  ensureDir(scopeLocksDir(scopeId))
-  ensureDir(scopeRunsDir(scopeId))
+  ensureDirUserOnly(scopeJobsDir(scopeId))
+  ensureDirUserOnly(scopeLocksDir(scopeId))
+  ensureDirUserOnly(scopeRunsDir(scopeId))
   ensureDir(scopeLogsDir(scopeId))
 }
 
@@ -1590,7 +2057,8 @@ function saveJob(job: Job): void {
   const normalizedJob: Job = { ...job, scopeId }
   ensureScopeStorage(scopeId)
   const path = jobFilePath(scopeId, normalizedJob.slug)
-  writeFileSync(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2))
+  // Job files contain env.snapshot with secrets — must be 0600.
+  writeFileUserOnly(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2))
 }
 
 function deleteJobFile(job: Job): void {
@@ -1799,6 +2267,83 @@ function formatGlobalCleanupOutput(execution: GlobalCleanupExecution): string {
   }
 
   return lines.join("\n")
+}
+
+// === Session policy parsers / validators (S4 + S6) ===
+
+export function parseSessionPolicy(raw: unknown): SessionPolicy {
+  if (raw === undefined || raw === null) return "current"
+  if (typeof raw !== "string") {
+    throw new Error("sessionPolicy must be a string")
+  }
+  const trimmed = raw.trim()
+  if (!trimmed) return "current"
+  if (trimmed === "current" || trimmed === "existing" || trimmed === "new-per-job" || trimmed === "new-per-run") {
+    return trimmed
+  }
+  throw new Error(`Invalid sessionPolicy: ${trimmed} (expected: current | existing | new-per-job | new-per-run)`)
+}
+
+export function parseExecutionPolicy(raw: unknown): ExecutionPolicy {
+  if (raw === undefined || raw === null) return "prefer-live-server"
+  if (typeof raw !== "string") {
+    throw new Error("executionPolicy must be a string")
+  }
+  const trimmed = raw.trim()
+  if (!trimmed) return "prefer-live-server"
+  if (trimmed === "prefer-live-server" || trimmed === "headless-only") return trimmed
+  throw new Error(`Invalid executionPolicy: ${trimmed} (expected: prefer-live-server | headless-only)`)
+}
+
+export function parseDeliveryPolicy(raw: unknown): DeliveryPolicy {
+  if (raw === undefined || raw === null) return "execute"
+  if (typeof raw !== "string") {
+    throw new Error("deliveryPolicy must be a string")
+  }
+  const trimmed = raw.trim()
+  if (!trimmed) return "execute"
+  if (trimmed === "execute" || trimmed === "leave-message") return trimmed
+  throw new Error(`Invalid deliveryPolicy: ${trimmed} (expected: execute | leave-message)`)
+}
+
+/**
+ * Schedule-time validation matrix (S6). Returns an error message string
+ * if validation fails, or undefined on success.
+ *
+ * The session.create call for new-per-job is performed by the caller
+ * (it needs the resolved id) — this function only checks the
+ * preconditions that are local to the args themselves.
+ */
+export function validateSessionPolicyArgs(input: {
+  sessionPolicy: SessionPolicy
+  executionPolicy: ExecutionPolicy
+  deliveryPolicy: DeliveryPolicy
+  sessionId?: string
+  attachUrl?: string
+  toolSessionID?: string
+}): string | undefined {
+  const sid = (input.sessionId ?? "").trim()
+
+  if (input.sessionPolicy === "current") {
+    const fallback = (input.toolSessionID ?? "").trim()
+    if (!sid && !fallback) {
+      return "sessionPolicy='current' requires a session context (run from inside an opencode session) or pass sessionId explicitly."
+    }
+  }
+
+  if (input.sessionPolicy === "existing" && !sid) {
+    return "sessionPolicy='existing' requires sessionId."
+  }
+
+  if (input.executionPolicy === "headless-only" && input.attachUrl) {
+    return "executionPolicy='headless-only' is incompatible with attachUrl. Drop attachUrl or use executionPolicy='prefer-live-server'."
+  }
+
+  // leave-message + headless-only is a no-op (headless always executes).
+  // We accept it but log a warning into the result; the caller renders.
+  // (Not a hard error per plan.)
+
+  return undefined
 }
 
 function normalizeAttachUrl(attachUrl?: string): string | undefined {
@@ -2095,7 +2640,38 @@ function normalizeJob(raw: unknown): Job | null {
   const inv = normalizeJobInvocation(raw.invocation)
   if (inv) job.invocation = inv
 
+  const env = normalizeJobEnv(raw.env)
+  if (env) job.env = env
+
+  if (raw.sessionPolicy === "current" || raw.sessionPolicy === "existing" || raw.sessionPolicy === "new-per-job" || raw.sessionPolicy === "new-per-run") {
+    job.sessionPolicy = raw.sessionPolicy
+  }
+  if (raw.executionPolicy === "prefer-live-server" || raw.executionPolicy === "headless-only") {
+    job.executionPolicy = raw.executionPolicy
+  }
+  if (raw.deliveryPolicy === "execute" || raw.deliveryPolicy === "leave-message") {
+    job.deliveryPolicy = raw.deliveryPolicy
+  }
+
+  const headlessInv = normalizeJobInvocation(raw.headlessInvocation)
+  if (headlessInv) job.headlessInvocation = headlessInv
+
   return sanitizeJob(job)
+}
+
+function normalizeJobEnv(raw: unknown): JobEnv | undefined {
+  if (!isRecord(raw)) return undefined
+  const mode = raw.mode
+  if (mode !== "snapshot" && mode !== "minimal" && mode !== "login-shell") return undefined
+  const result: JobEnv = { mode }
+  if (isRecord(raw.snapshot)) {
+    const snapshot: Record<string, string> = {}
+    for (const [key, value] of Object.entries(raw.snapshot)) {
+      if (typeof value === "string") snapshot[key] = value
+    }
+    if (Object.keys(snapshot).length > 0) result.snapshot = snapshot
+  }
+  return result
 }
 
 function findJobByName(
@@ -2167,14 +2743,42 @@ function getLogPath(job: Job): string {
   return scopedLogPath(scopeId, job.slug)
 }
 
-function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
+function buildOpencodeArgs(job: Job, options?: { withAttachUrl?: boolean }): { command: string; args: string[] } {
+  const inner = buildOpencodeArgsInner(job, options)
+
+  // env.mode='login-shell' wraps the invocation in `$SHELL -lic '...'` so the
+  // user's interactive shell rc files run before opencode does. Useful when
+  // PATH/env capture (S2) is insufficient (e.g. lazily-loaded NVM that runs
+  // only via .zshrc / .bashrc). Skipped on Windows: schtasks does not have an
+  // equivalent, so we silently fall back to the direct invocation.
+  //
+  // Fallback to /bin/bash when $SHELL isn't set: bash is universally
+  // available on macOS (even when default is zsh) and Linux. zsh is not
+  // guaranteed on minimal Linux server images.
+  if (job.env?.mode === "login-shell" && !IS_WINDOWS) {
+    const shell = (process.env.SHELL ?? "").trim() || "/bin/bash"
+    const flat = [inner.command, ...inner.args].map(shellEscapeSingleQuoted).join(" ")
+    return { command: shell, args: ["-lic", flat] }
+  }
+
+  return inner
+}
+
+function shellEscapeSingleQuoted(value: string): string {
+  // POSIX-safe single-quoted escape: end quote, escape '\'', re-open quote.
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function buildOpencodeArgsInner(job: Job, options?: { withAttachUrl?: boolean }): { command: string; args: string[] } {
   const command = findOpencode()
   const run = normalizeRunSpec(getJobRun(job))
   validateRunSpec(run)
 
   const args = ["run"]
 
-  if (run.attachUrl) {
+  // For headless invocation snapshots, omit `--attach` so the run
+  // spawns its own session-bound process (no live HTTP).
+  if (run.attachUrl && options?.withAttachUrl !== false) {
     args.push("--attach", run.attachUrl)
   }
 
@@ -2229,9 +2833,9 @@ function buildOpencodeArgs(job: Job): { command: string; args: string[] } {
 }
 
 function buildRunEnvironment(): NodeJS.ProcessEnv {
-  const enhancedPath = getEnhancedPath()
-  const existingPath = process.env.PATH
-  const combinedPath = existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath
+  // Terminal PATH first, fallback list second. getEnhancedPath() already
+  // dedups, so explicit concatenation with process.env.PATH is unnecessary.
+  const combinedPath = getEnhancedPath({ withTerminalPath: true })
 
   // Keep scheduled jobs non-interactive by default.
   //
@@ -2251,22 +2855,13 @@ function buildRunEnvironment(): NodeJS.ProcessEnv {
     return basePolicy
   })()
 
-  const baseEnv: NodeJS.ProcessEnv = { ...process.env }
+  // Pass through full process.env (terminal parity for in-process runs).
+  // Scheduled runs handled by supervisor.pl get their env from job.env.snapshot
+  // — this function is only used for manual `run_job` and helper subprocess
+  // calls (isCommandAvailable, getOpencodeVersion, getJobLogs).
   const config = loadSchedulerConfig()
-  const preserveOpencodeEnv = config.env?.preserveOpencodeEnv === true
-  const preserved = new Set(["OPENCODE_PERMISSION", ...(config.env?.preserve ?? [])])
-
-  if (!preserveOpencodeEnv) {
-    for (const key of Object.keys(baseEnv)) {
-      if (!key.startsWith("OPENCODE_")) continue
-      if (key.startsWith("OPENCODE_SCHEDULER_")) continue
-      if (preserved.has(key)) continue
-      delete baseEnv[key]
-    }
-  }
-
   return {
-    ...baseEnv,
+    ...process.env,
     ...config.env?.set,
     PATH: combinedPath,
     OPENCODE_PERMISSION: JSON.stringify(mergedPolicy),
@@ -2279,8 +2874,47 @@ function loadSchedulerConfig(): SchedulerConfig {
     const raw = readFileSync(SCHEDULER_CONFIG, "utf-8")
     const parsed = JSON.parse(raw) as unknown
     if (!isRecord(parsed)) return {}
+
+    const env = isRecord(parsed.env) ? (parsed.env as Record<string, unknown>) : undefined
+    if (env) {
+      // Detect legacy keys and warn (one-shot) — they're accepted into the
+      // type for back-compat but no longer have any effect.
+      const legacy: string[] = []
+      if ("preserve" in env) legacy.push("env.preserve")
+      if ("preserveOpencodeEnv" in env) legacy.push("env.preserveOpencodeEnv")
+      if (legacy.length > 0) warnLegacyEnvKeysOnce(legacy)
+
+      // Reject unknown env.mode values rather than silently defaulting.
+      // Throws so the user notices misconfig instead of getting wrong env.
+      if ("mode" in env) {
+        const mode = env.mode
+        if (mode !== "snapshot" && mode !== "minimal" && mode !== "login-shell") {
+          throw new Error(
+            `Invalid env.mode in ${SCHEDULER_CONFIG}: ${String(mode)} (expected: snapshot | minimal | login-shell)`
+          )
+        }
+      }
+
+      // Reject env.set keys that collide with the scheduler-internal denylist —
+      // they would never propagate anyway.
+      if (isRecord(env.set)) {
+        for (const key of Object.keys(env.set)) {
+          if (ENV_DENYLIST_INTERNAL.has(key)) {
+            throw new Error(
+              `Invalid env.set in ${SCHEDULER_CONFIG}: '${key}' is reserved by the scheduler and cannot be set.`
+            )
+          }
+        }
+      }
+    }
+
     return parsed as SchedulerConfig
-  } catch {
+  } catch (error) {
+    // If validation threw, propagate so schedule_job surfaces the message.
+    // For JSON parse errors etc., return empty config (best-effort).
+    if (error instanceof Error && /Invalid env\./.test(error.message)) {
+      throw error
+    }
     return {}
   }
 }
@@ -2532,9 +3166,62 @@ function getJobLogs(job: Job, options?: { tailLines?: number; maxChars?: number 
   }
 }
 
+/**
+ * Resolve the base URL to use for a session-API call. Prefers a caller-
+ * supplied `attachUrl` (typically pointing at a remote server) and falls
+ * back to the in-process `serverUrl` provided by the plugin runtime.
+ */
+function resolveSessionApiBase(attachUrl: string | undefined, serverUrl: URL): string {
+  if (attachUrl) return attachUrl.replace(/\/+$/, "")
+  return serverUrl.toString().replace(/\/+$/, "")
+}
+
+/**
+ * Create a session via raw fetch. Bypasses the SDK because v1's
+ * `SessionCreateData.body` does not type `permission` even though the
+ * server route accepts it. Returns the new session id, or throws.
+ */
+async function createSchedulerSession(input: {
+  baseUrl: string
+  title: string
+  permission: readonly ScheduledPermissionRule[]
+}): Promise<string> {
+  const res = await fetch(`${input.baseUrl}/session`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: input.title, permission: input.permission }),
+  })
+  if (!res.ok) {
+    const body = await res.text().catch(() => "")
+    throw new Error(`POST /session failed: ${res.status} ${res.statusText} ${body}`.trim())
+  }
+  const json = (await res.json().catch(() => null)) as { id?: string } | null
+  if (!json?.id) {
+    throw new Error("POST /session returned no id")
+  }
+  return json.id
+}
+
+/**
+ * Verify a session exists at the given base URL (GET /session/<id>).
+ * Throws on 404 or network failure; returns silently on success.
+ */
+async function verifySessionExists(input: { baseUrl: string; sessionId: string }): Promise<void> {
+  const res = await fetch(`${input.baseUrl}/session/${encodeURIComponent(input.sessionId)}`, {
+    method: "GET",
+    signal: AbortSignal.timeout(1500),
+  })
+  if (res.status === 404) {
+    throw new Error(`Session ${input.sessionId} not found at ${input.baseUrl}`)
+  }
+  if (!res.ok) {
+    throw new Error(`GET /session/${input.sessionId} failed: ${res.status} ${res.statusText}`)
+  }
+}
+
 // === PLUGIN ===
 
-export const SchedulerPlugin: Plugin = async () => {
+export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
   return {
     tool: {
        schedule_job: tool({
@@ -2573,6 +3260,28 @@ export const SchedulerPlugin: Plugin = async () => {
               .string()
               .optional()
               .describe("Optional: attach URL for opencode run (e.g. http://localhost:4096)."),
+            sessionPolicy: tool.schema
+              .string()
+              .optional()
+              .describe(
+                "Optional: 'current' (default; into calling session), 'existing' (require sessionId), 'new-per-job' (create one session up-front), 'new-per-run' (fresh session each fire)."
+              ),
+            sessionId: tool.schema
+              .string()
+              .optional()
+              .describe("Optional: explicit session id (required when sessionPolicy='existing')."),
+            executionPolicy: tool.schema
+              .string()
+              .optional()
+              .describe(
+                "Optional: 'prefer-live-server' (default; live HTTP delivery if reachable, else headless) or 'headless-only' (always spawn CLI, no live HTTP)."
+              ),
+            deliveryPolicy: tool.schema
+              .string()
+              .optional()
+              .describe(
+                "Optional: 'execute' (default; wait for idle session) or 'leave-message' (post immediately with noReply, user picks up later)."
+              ),
             timeoutSeconds: tool.schema
               .number()
               .optional()
@@ -2580,7 +3289,7 @@ export const SchedulerPlugin: Plugin = async () => {
             format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
           },
 
-          async execute(args) {
+          async execute(args, ctx) {
             const format = normalizeFormat(args.format)
             const slug = args.source ? `${args.source}-${slugify(args.name)}` : slugify(args.name)
 
@@ -2658,6 +3367,107 @@ export const SchedulerPlugin: Plugin = async () => {
              return errorResult(format, `Invalid cron schedule: ${msg}`)
            }
 
+           // === Session policy resolution (S4) ===
+           let sessionPolicy: SessionPolicy
+           try {
+             sessionPolicy = parseSessionPolicy(args.sessionPolicy)
+           } catch (error) {
+             const msg = error instanceof Error ? error.message : String(error)
+             return errorResult(format, msg)
+           }
+
+           let executionPolicy: ExecutionPolicy
+           try {
+             executionPolicy = parseExecutionPolicy(args.executionPolicy)
+           } catch (error) {
+             const msg = error instanceof Error ? error.message : String(error)
+             return errorResult(format, msg)
+           }
+
+           let deliveryPolicy: DeliveryPolicy
+           try {
+             deliveryPolicy = parseDeliveryPolicy(args.deliveryPolicy)
+           } catch (error) {
+             const msg = error instanceof Error ? error.message : String(error)
+             return errorResult(format, msg)
+           }
+
+           // S6: validation matrix.
+           const policyError = validateSessionPolicyArgs({
+             sessionPolicy,
+             executionPolicy,
+             deliveryPolicy,
+             sessionId: args.sessionId,
+             attachUrl,
+             toolSessionID: ctx?.sessionID,
+           })
+           if (policyError) {
+             return errorResult(format, policyError)
+           }
+
+           // Resolve effective session id at schedule-time per policy.
+           const sessionApiBase = resolveSessionApiBase(attachUrl, serverUrl)
+           let resolvedSessionId: string | undefined
+
+           if (sessionPolicy === "current") {
+             resolvedSessionId = (args.sessionId ?? "").trim() || ctx?.sessionID
+             if (resolvedSessionId && attachUrl) {
+               try {
+                 await verifySessionExists({ baseUrl: sessionApiBase, sessionId: resolvedSessionId })
+               } catch (error) {
+                 const msg = error instanceof Error ? error.message : String(error)
+                 return errorResult(format, `sessionPolicy='current': ${msg}`)
+               }
+             }
+           } else if (sessionPolicy === "existing") {
+             resolvedSessionId = (args.sessionId ?? "").trim()
+             if (attachUrl) {
+               try {
+                 await verifySessionExists({ baseUrl: sessionApiBase, sessionId: resolvedSessionId! })
+               } catch (error) {
+                 const msg = error instanceof Error ? error.message : String(error)
+                 return errorResult(format, `sessionPolicy='existing': ${msg}`)
+               }
+             }
+           } else if (sessionPolicy === "new-per-job") {
+             try {
+               resolvedSessionId = await createSchedulerSession({
+                 baseUrl: sessionApiBase,
+                 title: args.name,
+                 permission: SCHEDULED_PERMS,
+               })
+             } catch (error) {
+               const msg = error instanceof Error ? error.message : String(error)
+               return errorResult(format, `sessionPolicy='new-per-job': ${msg}`)
+             }
+           }
+           // new-per-run: leave resolvedSessionId undefined; runner creates per fire.
+
+           // Mark `client` as intentionally unused for now (kept on the plugin
+           // signature for forward-compatibility once the SDK adds a typed
+           // session.create({ permission }) variant).
+           void client
+
+           // Capture per-job env snapshot. loadSchedulerConfig() throws on
+           // invalid env.mode / denylisted env.set keys — route through the
+           // same errorResult pipeline as every other validation failure.
+           let capturedEnv: JobEnv
+           try {
+             capturedEnv = captureJobEnv(loadSchedulerConfig().env)
+           } catch (error) {
+             const msg = error instanceof Error ? error.message : String(error)
+             return errorResult(format, `Failed to capture env: ${msg}`)
+           }
+
+           // Promote resolved session into the run spec so buildOpencodeArgs
+           // emits `--session <id>` (and optional `--attach`).
+           if (resolvedSessionId) {
+             run.session = resolvedSessionId
+           }
+           if (attachUrl) {
+             run.attachUrl = attachUrl
+           }
+
             const job: Job = {
               scopeId,
               slug,
@@ -2669,13 +3479,20 @@ export const SchedulerPlugin: Plugin = async () => {
               source: args.source,
               workdir,
               attachUrl,
+              sessionPolicy,
+              executionPolicy,
+              deliveryPolicy,
               timeoutSeconds: args.timeoutSeconds,
+              env: capturedEnv,
               createdAt: new Date().toISOString(),
             }
 
-            // Snapshot invocation for supervised scheduled runs.
+            // Snapshot both invocations:
+            // - invocation:           live-capable form (with --attach if set)
+            // - headlessInvocation:   no --attach; subprocess fallback for the runner
             try {
               job.invocation = buildOpencodeArgs(job)
+              job.headlessInvocation = buildOpencodeArgs(job, { withAttachUrl: false })
             } catch (error) {
               const msg = error instanceof Error ? error.message : String(error)
               return errorResult(format, `Failed to build invocation: ${msg}`)
@@ -3067,6 +3884,7 @@ Commands:
           // Keep scheduled invocation snapshot up-to-date.
           try {
             updatedJob.invocation = buildOpencodeArgs(updatedJob)
+            updatedJob.headlessInvocation = buildOpencodeArgs(updatedJob, { withAttachUrl: false })
           } catch (error) {
             const msg = error instanceof Error ? error.message : String(error)
             return errorResult(format, `Failed to build invocation: ${msg}`)

@@ -68,6 +68,109 @@ Jobs run from the working directory where you created them, picking up your `ope
 - **No overlap**: if the previous run is still active, the next scheduled tick is skipped.
 - **Non-interactive by default**: scheduled runs force `OPENCODE_PERMISSION` to deny "question" prompts, so jobs don't hang waiting for approvals.
 - **Optional timeout**: set `timeoutSeconds` to hard-stop long runs (SIGTERM, then SIGKILL).
+- **Terminal env parity**: at schedule-time the plugin captures the full terminal env (PATH, MCP tokens, plugin secrets, locale) and persists it on the job. Scheduled runs see the same env as your interactive `opencode`. See [Env behavior](#env-behavior) for tuning and trust-boundary notes.
+
+### Live HTTP delivery (live runner)
+
+When a job is scheduled with `attachUrl` pointing at a reachable opencode server, the supervisor runs a small **runner** (`runner.js`) that delivers the prompt over HTTP instead of spawning a second `opencode run` process:
+
+- preflight `/global/health` + `/session/<id>` (1.5s timeout)
+- if the session is busy and `deliveryPolicy='execute'` (default), wait up to `timeoutSeconds` for it to go idle, then deliver
+- if `deliveryPolicy='leave-message'`, deliver immediately with `noReply: true` so the user/agent picks the message up later
+- on any HTTP/network failure (exit 10), the supervisor falls back to the headless `opencode run` invocation captured at schedule-time
+- contract errors (session 404 etc.; exit 11) abort without falling back
+
+Each fire-time attempt appends a structured record to `~/.config/opencode/scheduler/scopes/<scope>/runs/<slug>.jsonl` (delivery, attachUrl, sessionId, httpStatus, error, durationMs).
+
+### Session policies
+
+`schedule_job` and `update_job` accept a `sessionPolicy` argument controlling which opencode session a scheduled run writes into:
+
+| Policy | Behavior |
+|--------|----------|
+| `current` (default) | Use the session that called `schedule_job`. Requires running from inside an opencode session, or `sessionId` passed explicitly. |
+| `existing` | Use a session id you supply. Requires `sessionId`. |
+| `new-per-job` | Create one dedicated session at schedule-time and reuse it for every run. The new session gets `question`/`plan_enter`/`plan_exit` denied permanently. |
+| `new-per-run` | Create a fresh session at every fire (runner POSTs `/session` with the same deny rules). |
+
+**Permission semantics** — `current` and `existing` inherit the chosen session's existing permission ruleset; the scheduler does NOT mutate it (no public PATCH route accepts permission changes). If you want strict no-questions, pick `new-per-job` or `new-per-run`. The headless fallback subprocess always gets `OPENCODE_PERMISSION={"question":"deny"}` via supervisor env.
+
+`executionPolicy` controls live-vs-headless preference:
+
+- `prefer-live-server` (default) — try live HTTP if `attachUrl` set, fall back to headless on failure.
+- `headless-only` — never attempt live HTTP. Mutually exclusive with `attachUrl`.
+
+`deliveryPolicy` controls busy handling on live delivery:
+
+- `execute` (default) — wait for the session to go idle, then deliver.
+- `leave-message` — deliver immediately with `noReply: true`; user resumes manually.
+
+### Env behavior
+
+At schedule-time, the plugin captures the **full terminal env** as a per-job snapshot, minus a small denylist (`OPENCODE_PERMISSION`, `OPENCODE_SCHEDULER_RUN_ID`, `OLDPWD`, `PWD`, `SHLVL`, `_`). The snapshot is written into the OS scheduler entry (launchd plist `EnvironmentVariables`, systemd `Environment="K=V"`, cron inline preamble) and merged back into `%ENV` by `supervisor.pl` before exec.
+
+This fixes the `env: node: No such file or directory` failure on hosts using NVM/asdf/mise/Volta/pnpm/Bun without baking only PATH; MCP/plugin tokens (`OPENCODE_API_KEY`, MCP server credentials, etc.) carry over too.
+
+**Trust boundary** — the snapshot may contain secrets. It lives only under user-only files: `~/.config/opencode/scheduler/scopes/...`, `~/Library/LaunchAgents/...`, `~/.config/systemd/user/...`. We do not ship secrets across machines or users.
+
+Override via `~/.config/opencode/opencode-scheduler.json`:
+
+```json
+{
+  "env": {
+    "mode": "snapshot",
+    "exclude": ["MY_DEBUG_TOKEN"],
+    "set":     { "OPENCODE_AUTO_SHARE": "1" }
+  }
+}
+```
+
+Modes:
+
+- `snapshot` (default) — full `process.env` minus denylist + `exclude`.
+- `minimal` — only `PATH`, `HOME`, `USER`, `SHELL`. Use when you want strict-env runs.
+- `login-shell` — same snapshot capture as `snapshot`, plus the invocation is wrapped in `$SHELL -lic '...'` so your interactive shell rc files run before opencode does. Useful when PATH/env relies on a lazy initializer (e.g. NVM via `.zshrc`). Skipped on Windows.
+
+Legacy keys `env.preserve` / `env.preserveOpencodeEnv` are accepted but ignored with a one-shot warning.
+
+Jobs created on `v1.3.x` (no `env` field) fall back to `mode='minimal'` at supervisor time and print a one-line warning into the log telling you to recreate the job.
+
+#### How env actually flows at fire-time
+
+The OS scheduler entry (launchd plist / systemd unit / cron line) only sets the **bootstrap env** — `PATH`, `HOME`, `USER`, `SHELL`. Everything else (the full snapshot from `captureJobEnv`) lives in `job.json` under `env.snapshot` and is merged into `%ENV` by `supervisor.pl` before exec'ing the actual command.
+
+Why two layers:
+
+1. The bootstrap env exists so `/usr/bin/env node` can find Node and `/usr/bin/perl` can find `$HOME` for log paths. Tiny, no risk of bloating unit files or hitting cron line-length limits.
+2. The full snapshot lives in `job.json` (already user-only) — single source of truth for runtime env. Editing `job.env.snapshot` re-takes effect on the next fire without rewriting the OS scheduler entry.
+
+#### Shell selection (login-shell mode)
+
+When `mode: 'login-shell'` is set, the captured invocation becomes `$SHELL -lic '<original-cmd>'`. We trust `$SHELL` from the terminal where you scheduled the job, with `/bin/bash` as a portable fallback (bash is universally available on macOS — even when default is zsh — and on every Linux). zsh is **not** assumed because minimal Linux server images often ship without it.
+
+### Linux notes
+
+**Backend preference**: on Linux the plugin uses `systemd --user` when available (every modern desktop distro and most server distros). Cron is the fallback for stripped-down environments without user systemd (some headless containers, NixOS, openrc-based distros).
+
+**Cron line length**: historical `vixie-cron` had a ~1 KB per-line limit. The plugin emits only the bootstrap env (4 keys) inline; the rest comes from `job.env.snapshot` via supervisor.pl, so even with 100+ env vars the crontab line stays well under any limit.
+
+**Distros tested in CI logic** (all paths exercised by unit tests; backend integration M1–M7 must be run on the host):
+
+- Ubuntu/Debian, Fedora/RHEL, Arch, openSUSE — `systemd --user`
+- Alpine, NixOS, openrc — `cron` fallback (PATH first, then OS PATH)
+
+**Known gaps still on Linux**:
+
+- `getEnhancedPath` fallback list contains `/opt/homebrew/bin` (Mac-specific). Harmless on Linux — just an unused PATH entry.
+- The plugin does not auto-detect uninstalled `node` on the host. If `/usr/bin/env node` finds nothing, the runner short-circuits (exit 10) and supervisor falls back to the headless `opencode run` invocation that doesn't need Node.
+
+### Windows notes
+
+Windows scheduled runs go through `schtasks` directly (no supervisor pipeline). As a result:
+
+- The terminal env snapshot is **not** propagated to scheduled tasks (Task Scheduler has no native env-block hook). Jobs run with system env. If your job depends on user env (PATH for Node, MCP tokens), schedule on the same machine using the WSL2 backend (`opencode-scheduler` on Linux) or pin all required env in the prompt itself.
+- No-overlap and timeout enforcement come from the OS, not the supervisor.
+- Live HTTP delivery via the runner works on Windows (Node + fetch are cross-platform), but only if you start opencode server from Windows side and pass `attachUrl`.
 
 ### Platform Support
 
@@ -126,6 +229,18 @@ Jobs use standard 5-field cron expressions:
 | `job_logs` | View the latest logs from a job |
 
 `schedule_job` and `update_job` accept an optional `timeoutSeconds` (integer seconds). Use `0` (or omit) to disable.
+
+`schedule_job` also accepts:
+
+| Arg | Default | Meaning |
+|-----|---------|---------|
+| `sessionPolicy` | `current` | `current` / `existing` / `new-per-job` / `new-per-run` — see [Session policies](#session-policies). |
+| `sessionId` | — | Required for `existing`; optional explicit override for `current`. |
+| `executionPolicy` | `prefer-live-server` | `prefer-live-server` (default; live HTTP if reachable, else headless) or `headless-only`. |
+| `deliveryPolicy` | `execute` | `execute` (default; wait for idle) or `leave-message` (post with `noReply: true`). |
+| `attachUrl` | — | Live-server base URL for HTTP delivery (e.g. `http://127.0.0.1:4096`). |
+
+See [`docs/SCHEDULING.md`](./docs/SCHEDULING.md) for agent-facing inference rules.
 
 Tools accept an optional `format: "json"` argument to return structured output with `success`, `output`, `shouldContinue`, and `data`.
 
