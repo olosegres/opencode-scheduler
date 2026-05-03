@@ -12335,9 +12335,9 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // src/index.ts
-import { chmodSync, createWriteStream, existsSync as existsSync2, mkdirSync as mkdirSync2, readdirSync as readdirSync2, readFileSync as readFileSync2, renameSync as renameSync2, rmSync, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
-import { basename, dirname, join as join2, resolve as resolvePath } from "path";
-import { homedir as homedir2, platform } from "os";
+import { chmodSync, createWriteStream, existsSync as existsSync3, mkdirSync as mkdirSync3, readdirSync as readdirSync2, readFileSync as readFileSync3, renameSync as renameSync3, rmSync, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
+import { basename, dirname as dirname2, join as join3, resolve as resolvePath } from "path";
+import { homedir as homedir3, platform } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
 import { fileURLToPath } from "url";
 
@@ -12406,26 +12406,168 @@ function sweepStaleEntries(dir = getRuntimeDir()) {
   return { scanned: files.length, removed };
 }
 
+// src/serverConfig.ts
+import { closeSync, existsSync as existsSync2, fsyncSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, renameSync as renameSync2, writeSync } from "fs";
+import { homedir as homedir2 } from "os";
+import { dirname, join as join2 } from "path";
+var DEFAULT_OPENCODE_CONFIG_PATH = join2(homedir2(), ".config", "opencode", "opencode.json");
+var DEFAULT_SERVER_PORT = 0;
+function readOpencodeConfig(path = DEFAULT_OPENCODE_CONFIG_PATH) {
+  if (!existsSync2(path))
+    return {};
+  const raw = readFileSync2(path, "utf-8");
+  if (!raw.trim())
+    return {};
+  const parsed = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Config at ${path} is not a JSON object (got ${Array.isArray(parsed) ? "array" : typeof parsed}).`);
+  }
+  return parsed;
+}
+function planServerConfigUpdate(current, desiredPort) {
+  const before = current;
+  const existingServer = current.server;
+  const serverIsObject = existingServer !== null && typeof existingServer === "object" && !Array.isArray(existingServer);
+  if (!serverIsObject) {
+    const after2 = { ...current, server: { port: desiredPort } };
+    return {
+      action: { kind: "add-server", port: desiredPort },
+      before,
+      after: after2,
+      diff: `+ server: { port: ${desiredPort} }`
+    };
+  }
+  const serverObj = existingServer;
+  const existingPortRaw = serverObj.port;
+  if (existingPortRaw === undefined) {
+    const after2 = { ...current, server: { ...serverObj, port: desiredPort } };
+    return {
+      action: { kind: "add-port", port: desiredPort },
+      before,
+      after: after2,
+      diff: `+ server.port: ${desiredPort}`
+    };
+  }
+  if (existingPortRaw === desiredPort) {
+    return {
+      action: { kind: "noop", reason: "port-already-matches" },
+      before,
+      after: current,
+      diff: `(no change \u2014 server.port is already ${desiredPort})`
+    };
+  }
+  if (typeof existingPortRaw !== "number") {
+    throw new Error(`Existing server.port is not a number (${typeof existingPortRaw}); refuse to overwrite blindly.`);
+  }
+  const after = { ...current, server: { ...serverObj, port: desiredPort } };
+  return {
+    action: { kind: "overwrite-port", previous: existingPortRaw, next: desiredPort },
+    before,
+    after,
+    diff: `~ server.port: ${existingPortRaw} \u2192 ${desiredPort}`
+  };
+}
+function writeOpencodeConfigAtomic(path, next) {
+  const dir = dirname(path);
+  if (!existsSync2(dir))
+    mkdirSync2(dir, { recursive: true, mode: 448 });
+  const serialized = JSON.stringify(next, null, 2) + `
+`;
+  const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}`;
+  const fd = openSync(tmpPath, "w", 384);
+  try {
+    writeSync(fd, serialized);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync2(tmpPath, path);
+  try {
+    const dirFd = openSync(dir, "r");
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
+  } catch {}
+  const roundTrip = readFileSync2(path, "utf-8");
+  JSON.parse(roundTrip);
+  return { written: path, serialized };
+}
+function executeInstallServerConfig(args) {
+  const port = args.port ?? DEFAULT_SERVER_PORT;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    return {
+      ok: false,
+      status: "invalid-port",
+      reason: `port must be an integer in [0, 65535] (got ${args.port}).`
+    };
+  }
+  const configPath = args.configPath ?? DEFAULT_OPENCODE_CONFIG_PATH;
+  let current;
+  try {
+    current = readOpencodeConfig(configPath);
+  } catch (error45) {
+    return {
+      ok: false,
+      status: "read-error",
+      reason: error45 instanceof Error ? error45.message : String(error45),
+      configPath
+    };
+  }
+  let plan;
+  try {
+    plan = planServerConfigUpdate(current, port);
+  } catch (error45) {
+    return {
+      ok: false,
+      status: "plan-error",
+      reason: error45 instanceof Error ? error45.message : String(error45),
+      configPath
+    };
+  }
+  if (plan.action.kind === "noop") {
+    return { ok: true, status: "noop", plan, configPath };
+  }
+  if (plan.action.kind === "overwrite-port" && !args.overwrite) {
+    return { ok: false, status: "needs-overwrite", plan, configPath };
+  }
+  if (!args.confirm) {
+    return { ok: true, status: "preview", plan, configPath };
+  }
+  try {
+    writeOpencodeConfigAtomic(configPath, plan.after);
+  } catch (error45) {
+    return {
+      ok: false,
+      status: "write-error",
+      reason: error45 instanceof Error ? error45.message : String(error45),
+      configPath
+    };
+  }
+  return { ok: true, status: "written", plan, configPath };
+}
+
 // src/index.ts
-var OPENCODE_CONFIG = join2(homedir2(), ".config", "opencode");
-var LEGACY_JOBS_DIR = join2(OPENCODE_CONFIG, "jobs");
-var LOGS_DIR = join2(OPENCODE_CONFIG, "logs");
-var SCHEDULER_DIR = join2(OPENCODE_CONFIG, "scheduler");
-var SCOPES_DIR = join2(SCHEDULER_DIR, "scopes");
-var SUPERVISOR_PATH = join2(SCHEDULER_DIR, "supervisor.pl");
-var SCHEDULER_CONFIG = join2(OPENCODE_CONFIG, "opencode-scheduler.json");
+var OPENCODE_CONFIG = join3(homedir3(), ".config", "opencode");
+var LEGACY_JOBS_DIR = join3(OPENCODE_CONFIG, "jobs");
+var LOGS_DIR = join3(OPENCODE_CONFIG, "logs");
+var SCHEDULER_DIR = join3(OPENCODE_CONFIG, "scheduler");
+var SCOPES_DIR = join3(SCHEDULER_DIR, "scopes");
+var SUPERVISOR_PATH = join3(SCHEDULER_DIR, "supervisor.pl");
+var SCHEDULER_CONFIG = join3(OPENCODE_CONFIG, "opencode-scheduler.json");
 var IS_MAC = platform() === "darwin";
 var IS_LINUX = platform() === "linux";
 var IS_WINDOWS = platform() === "win32";
-var LAUNCH_AGENTS_DIR = join2(homedir2(), "Library", "LaunchAgents");
+var LAUNCH_AGENTS_DIR = join3(homedir3(), "Library", "LaunchAgents");
 var LAUNCHD_PREFIX = "com.opencode.job";
-var SYSTEMD_USER_DIR = join2(homedir2(), ".config", "systemd", "user");
+var SYSTEMD_USER_DIR = join3(homedir3(), ".config", "systemd", "user");
 var WINDOWS_TASK_ROOT = "\\OpenCode";
 var WINDOWS_TASK_PREFIX = "opencode-job";
 var CRON_MANAGED_PREFIX = "opencode-scheduler";
 function ensureDir(dir) {
-  if (!existsSync2(dir)) {
-    mkdirSync2(dir, { recursive: true });
+  if (!existsSync3(dir)) {
+    mkdirSync3(dir, { recursive: true });
   }
 }
 function ensureDirUserOnly(dir) {
@@ -12441,7 +12583,7 @@ function writeFileUserOnly(path, content) {
     chmodSync(tmp, 384);
   } catch {}
   try {
-    renameSync2(tmp, path);
+    renameSync3(tmp, path);
   } catch {
     writeFileSync2(path, content);
     try {
@@ -12458,7 +12600,7 @@ function slugify(name) {
 function normalizeWorkdirPath(input) {
   const trimmed = input.trim();
   if (!trimmed)
-    return homedir2();
+    return homedir3();
   return resolvePath(trimmed);
 }
 function fnv1a64(input) {
@@ -12481,25 +12623,25 @@ function deriveScopeId(workdir) {
   return `${base}-${suffix}`;
 }
 function scopeDir(scopeId) {
-  return join2(SCOPES_DIR, scopeId);
+  return join3(SCOPES_DIR, scopeId);
 }
 function scopeJobsDir(scopeId) {
-  return join2(scopeDir(scopeId), "jobs");
+  return join3(scopeDir(scopeId), "jobs");
 }
 function scopeLocksDir(scopeId) {
-  return join2(scopeDir(scopeId), "locks");
+  return join3(scopeDir(scopeId), "locks");
 }
 function scopeRunsDir(scopeId) {
-  return join2(scopeDir(scopeId), "runs");
+  return join3(scopeDir(scopeId), "runs");
 }
 function scopeLogsDir(scopeId) {
-  return join2(LOGS_DIR, "scheduler", scopeId);
+  return join3(LOGS_DIR, "scheduler", scopeId);
 }
 function jobFilePath(scopeId, slug) {
-  return join2(scopeJobsDir(scopeId), `${slug}.json`);
+  return join3(scopeJobsDir(scopeId), `${slug}.json`);
 }
 function scopedLogPath(scopeId, slug) {
-  return join2(scopeLogsDir(scopeId), `${slug}.log`);
+  return join3(scopeLogsDir(scopeId), `${slug}.log`);
 }
 function currentScopeId() {
   return deriveScopeId(process.cwd());
@@ -12858,17 +13000,17 @@ function ensureSupervisorScript() {
   writeFileSync2(SUPERVISOR_PATH, SUPERVISOR_SCRIPT);
   ensureRunnerScript();
 }
-var RUNNER_PATH = join2(SCHEDULER_DIR, "runner.js");
+var RUNNER_PATH = join3(SCHEDULER_DIR, "runner.js");
 function ensureRunnerScript() {
   try {
-    const here = dirname(fileURLToPath(import.meta.url));
+    const here = dirname2(fileURLToPath(import.meta.url));
     const candidates = [
-      join2(here, "runner.js"),
-      join2(here, "..", "dist", "runner.js")
+      join3(here, "runner.js"),
+      join3(here, "..", "dist", "runner.js")
     ];
     for (const candidate of candidates) {
-      if (existsSync2(candidate)) {
-        writeFileSync2(RUNNER_PATH, readFileSync2(candidate));
+      if (existsSync3(candidate)) {
+        writeFileSync2(RUNNER_PATH, readFileSync3(candidate));
         return;
       }
     }
@@ -13065,6 +13207,12 @@ entry there, so a sibling TUI launched with \`--port\` can become the
 delivery target automatically \u2014 you only need to pass \`attachUrl\`
 explicitly for cross-host or otherwise non-discoverable targets.
 
+To make every opencode start register itself automatically (without
+adding \`--port\` to every shell alias), run \`install_server_config\`
+once. It writes \`server.port: 0\` (= try 4096, then OS-assigned
+random) into \`~/.config/opencode/opencode.json\`. The tool is
+two-step (preview \u2192 confirm) and idempotent \u2014 see README.
+
 ## Runtime Values: Dates
 
 If you need local dates, compute them at runtime.
@@ -13153,16 +13301,16 @@ function installBuiltinSkill(skill, rootDir, overwrite = false) {
   if (!installRoot) {
     throw new Error("Install directory cannot be empty.");
   }
-  if (!existsSync2(installRoot)) {
+  if (!existsSync3(installRoot)) {
     throw new Error(`Directory not found: ${installRoot}`);
   }
-  const relativeDir = dirname(skill.suggestedPath);
-  const installDir = join2(installRoot, relativeDir);
+  const relativeDir = dirname2(skill.suggestedPath);
+  const installDir = join3(installRoot, relativeDir);
   ensureDir(installDir);
   const files = [];
   for (const [filename, content] of Object.entries(skill.files)) {
-    const targetPath = join2(installDir, filename);
-    if (existsSync2(targetPath) && !overwrite) {
+    const targetPath = join3(installDir, filename);
+    if (existsSync3(targetPath) && !overwrite) {
       throw new Error(`File already exists: ${targetPath} (pass overwrite=true to replace)`);
     }
     writeFileSync2(targetPath, `${content.trimEnd()}
@@ -13176,8 +13324,8 @@ function ensureBestPracticesSkill(workdir) {
   if (Object.keys(skill.files).length !== 1) {
     throw new Error(`ensureBestPracticesSkill assumes a single-file skill; ${skill.name} now has ${Object.keys(skill.files).length} files. Update the presence check before adding more.`);
   }
-  const expectedPath = join2(workdir, skill.suggestedPath);
-  if (existsSync2(expectedPath)) {
+  const expectedPath = join3(workdir, skill.suggestedPath);
+  if (existsSync3(expectedPath)) {
     return { status: "present", path: expectedPath };
   }
   try {
@@ -13194,8 +13342,8 @@ function ensureBestPracticesSkill(workdir) {
 function loadPackageInfo() {
   const fallback = { name: "opencode-scheduler", version: "unknown" };
   try {
-    const packagePath = join2(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-    const raw = readFileSync2(packagePath, "utf-8");
+    const packagePath = join3(dirname2(fileURLToPath(import.meta.url)), "..", "package.json");
+    const raw = readFileSync3(packagePath, "utf-8");
     const parsed = JSON.parse(raw);
     return {
       name: typeof parsed.name === "string" ? parsed.name : fallback.name,
@@ -13223,10 +13371,10 @@ function findOpencode() {
   const paths = [
     "/opt/homebrew/bin/opencode",
     "/usr/local/bin/opencode",
-    join2(homedir2(), ".opencode", "bin", "opencode")
+    join3(homedir3(), ".opencode", "bin", "opencode")
   ];
   for (const p of paths) {
-    if (existsSync2(p)) {
+    if (existsSync3(p)) {
       return p;
     }
   }
@@ -13431,7 +13579,7 @@ function formatStartTime(hour, minute) {
   return `${pad2(hour)}:${pad2(minute)}`;
 }
 function windowsTaskBaseName(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   return `${WINDOWS_TASK_PREFIX}-${scopeId}-${job.slug}`;
 }
 function windowsTaskName(baseName, index, total) {
@@ -13549,7 +13697,7 @@ function cronToWindowsTaskDefinitions(job) {
   });
 }
 function createLaunchdPlist(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const jobPath = jobFilePath(scopeId, job.slug);
@@ -13568,7 +13716,7 @@ ${renderLaunchdCalendar(calendar)}
     `    <string>${escapePlistString(jobPath)}</string>`
   ].join(`
 `);
-  const workdir = job.workdir || homedir2();
+  const workdir = job.workdir || homedir3();
   const enhancedPath = getEnhancedPath();
   const envDict = renderLaunchdEnvDict(job, enhancedPath);
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -13608,17 +13756,17 @@ ${calendarXml}
 function installLaunchdJob(job) {
   ensureDir(LAUNCH_AGENTS_DIR);
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join2(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join3(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const plistPath = join2(LAUNCH_AGENTS_DIR, `${label}.plist`);
+  const plistPath = join3(LAUNCH_AGENTS_DIR, `${label}.plist`);
   try {
     execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" });
   } catch {}
-  if (existsSync2(legacyPlistPath)) {
+  if (existsSync3(legacyPlistPath)) {
     try {
       execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" });
     } catch {}
@@ -13628,13 +13776,13 @@ function installLaunchdJob(job) {
   execSync(`launchctl load "${plistPath}"`);
 }
 function uninstallLaunchdJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const scopedPlistPath = join2(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
+  const scopedPlistPath = join3(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join2(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join3(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
-    if (!existsSync2(plistPath))
+    if (!existsSync3(plistPath))
       continue;
     try {
       execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" });
@@ -13645,10 +13793,10 @@ function uninstallLaunchdJob(job) {
   }
 }
 function createSystemdService(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const jobPath = jobFilePath(scopeId, job.slug);
-  const workdir = job.workdir || homedir2();
+  const workdir = job.workdir || homedir3();
   const enhancedPath = getEnhancedPath();
   const envLines = renderSystemdEnvLines(job, enhancedPath);
   const execStart = ["/usr/bin/perl", SUPERVISOR_PATH, jobPath].map((arg) => `"${escapeSystemdArg(arg)}"`).join(" ");
@@ -13685,11 +13833,11 @@ WantedBy=timers.target
 function installSystemdJob(job) {
   ensureDir(SYSTEMD_USER_DIR);
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
-  const servicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const timerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const servicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const timerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
   try {
     execSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" });
     execSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" });
@@ -13701,7 +13849,7 @@ function installSystemdJob(job) {
   execSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`);
 }
 function uninstallSystemdJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const scopedTimerUnit = `opencode-job-${scopeId}-${job.slug}.timer`;
   const legacyTimerUnit = `opencode-job-${job.slug}.timer`;
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
@@ -13710,12 +13858,12 @@ function uninstallSystemdJob(job) {
       execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
     } catch {}
   }
-  const scopedServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const scopedTimerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
-  const legacyServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
-  const legacyTimerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
+  const scopedServicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const scopedTimerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const legacyServicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
+  const legacyTimerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
   for (const p of [scopedServicePath, scopedTimerPath, legacyServicePath, legacyTimerPath]) {
-    if (existsSync2(p)) {
+    if (existsSync3(p)) {
       try {
         unlinkSync2(p);
       } catch {}
@@ -13779,7 +13927,7 @@ function isCronAvailable() {
   return isCommandAvailable("crontab");
 }
 function cronBlockId(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   return `${scopeId}:${job.slug}`;
 }
 function cronLegacyBlockId(job) {
@@ -13852,7 +14000,7 @@ function stripManagedCronBlocks(content, blockIds) {
   };
 }
 function createCronEntry(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const jobPath = jobFilePath(scopeId, job.slug);
   const logFilePath = scopedLogPath(scopeId, job.slug);
   const escapedSupervisor = shellEscapeDoubleQuoted(SUPERVISOR_PATH);
@@ -13866,7 +14014,7 @@ function installCronJob(job) {
     throw new Error("cron backend is unavailable: `crontab` command not found.");
   }
   ensureDir(LOGS_DIR);
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
   const blockId = cronBlockId(job);
@@ -13950,10 +14098,10 @@ function ensureScopeStorage(scopeId) {
 function loadScopedJob(scopeId, slug) {
   ensureScopeStorage(scopeId);
   const path = jobFilePath(scopeId, slug);
-  if (!existsSync2(path))
+  if (!existsSync3(path))
     return null;
   try {
-    return normalizeJob(JSON.parse(readFileSync2(path, "utf-8")));
+    return normalizeJob(JSON.parse(readFileSync3(path, "utf-8")));
   } catch {
     return null;
   }
@@ -13963,7 +14111,7 @@ function loadAllScopedJobs(scopeId) {
   const files = readdirSync2(scopeJobsDir(scopeId)).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync2(join2(scopeJobsDir(scopeId), f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync3(join3(scopeJobsDir(scopeId), f), "utf-8")));
     } catch {
       return null;
     }
@@ -13974,7 +14122,7 @@ function listScopeIds() {
   try {
     return readdirSync2(SCOPES_DIR).filter((name) => {
       try {
-        return existsSync2(scopeDir(name));
+        return existsSync3(scopeDir(name));
       } catch {
         return false;
       }
@@ -13993,11 +14141,11 @@ function loadAllJobsAcrossScopes() {
 }
 function loadLegacyJob(slug) {
   ensureDir(LEGACY_JOBS_DIR);
-  const path = join2(LEGACY_JOBS_DIR, `${slug}.json`);
-  if (!existsSync2(path))
+  const path = join3(LEGACY_JOBS_DIR, `${slug}.json`);
+  if (!existsSync3(path))
     return null;
   try {
-    return normalizeJob(JSON.parse(readFileSync2(path, "utf-8")));
+    return normalizeJob(JSON.parse(readFileSync3(path, "utf-8")));
   } catch {
     return null;
   }
@@ -14007,38 +14155,38 @@ function loadAllLegacyJobs() {
   const files = readdirSync2(LEGACY_JOBS_DIR).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync2(join2(LEGACY_JOBS_DIR, f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync3(join3(LEGACY_JOBS_DIR, f), "utf-8")));
     } catch {
       return null;
     }
   }).filter(Boolean);
 }
 function saveJob(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const normalizedJob = { ...job, scopeId };
   ensureScopeStorage(scopeId);
   const path = jobFilePath(scopeId, normalizedJob.slug);
   writeFileUserOnly(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2));
 }
 function deleteJobFile(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const path = jobFilePath(scopeId, job.slug);
-  if (existsSync2(path)) {
+  if (existsSync3(path)) {
     unlinkSync2(path);
   }
 }
 function listDirectoryFiles(dir, options) {
-  if (!existsSync2(dir))
+  if (!existsSync3(dir))
     return [];
   try {
     const entries = readdirSync2(dir, { withFileTypes: true });
-    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join2(dir, name)).sort();
+    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join3(dir, name)).sort();
   } catch {
     return [];
   }
 }
 function listDirectoryNames(dir) {
-  if (!existsSync2(dir))
+  if (!existsSync3(dir))
     return [];
   try {
     return readdirSync2(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
@@ -14054,9 +14202,9 @@ function buildGlobalCleanupPlan(includeHistory) {
   const scopedJobDefinitionPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeJobsDir(scopeId), { suffix: ".json" }));
   const lockPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeLocksDir(scopeId), { suffix: ".json" }));
   const runHistoryPaths = includeHistory ? scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeRunsDir(scopeId), { suffix: ".jsonl" })) : [];
-  const schedulerLogsRoot = join2(LOGS_DIR, "scheduler");
+  const schedulerLogsRoot = join3(LOGS_DIR, "scheduler");
   const logScopeIds = listDirectoryNames(schedulerLogsRoot);
-  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join2(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
+  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join3(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
   const launchdPaths = IS_MAC ? listDirectoryFiles(LAUNCH_AGENTS_DIR, { prefix: `${LAUNCHD_PREFIX}.`, suffix: ".plist" }) : [];
   const systemdPaths = IS_LINUX ? [
     ...listDirectoryFiles(SYSTEMD_USER_DIR, { prefix: "opencode-job-", suffix: ".service" }),
@@ -14078,7 +14226,7 @@ function buildGlobalCleanupPlan(includeHistory) {
 function removePaths(paths, errors3) {
   const removed = [];
   for (const path of uniquePaths(paths)) {
-    if (!existsSync2(path))
+    if (!existsSync3(path))
       continue;
     try {
       rmSync(path, { recursive: true, force: true });
@@ -14105,7 +14253,7 @@ function executeGlobalCleanup(plan, options) {
   }
   const removeOrPreview = (paths) => {
     if (dryRun)
-      return uniquePaths(paths).filter((path) => existsSync2(path));
+      return uniquePaths(paths).filter((path) => existsSync3(path));
     return removePaths(paths, errors3);
   };
   const removed = {
@@ -14326,6 +14474,59 @@ function initRegistryForPlugin(input) {
   return { entry, sweepRemoved };
 }
 var REGISTRY_EXIT_HANDLERS_INSTALLED = new Set;
+function formatInstallServerConfigResult(result) {
+  if (result.ok && result.status === "preview") {
+    return [
+      `Preview only \u2014 nothing written.`,
+      `Config: ${result.configPath}`,
+      `Plan: ${result.plan.diff}`,
+      ``,
+      `Call install_server_config again with confirm: true to apply this change.`,
+      result.plan.action.kind === "overwrite-port" ? `Also pass overwrite: true (current server.port = ${result.plan.action.previous}).` : ``
+    ].filter(Boolean).join(`
+`);
+  }
+  if (result.ok && result.status === "noop") {
+    return [
+      `No change needed.`,
+      `Config: ${result.configPath}`,
+      result.plan.diff
+    ].join(`
+`);
+  }
+  if (result.ok && result.status === "written") {
+    return [
+      `Wrote ${result.configPath}.`,
+      `Change: ${result.plan.diff}`,
+      ``,
+      `Restart opencode for server.port to take effect (read at startup, not live-reloaded).`
+    ].join(`
+`);
+  }
+  if (!result.ok && result.status === "needs-overwrite") {
+    const action = result.plan.action.kind === "overwrite-port" ? result.plan.action : null;
+    const previous = action ? action.previous : "(unknown)";
+    const next = action ? action.next : "(unknown)";
+    return [
+      `Refusing to overwrite an existing different value.`,
+      `Config: ${result.configPath}`,
+      `Current server.port = ${previous}; requested = ${next}.`,
+      ``,
+      `Pass overwrite: true (and confirm: true) to replace it.`
+    ].join(`
+`);
+  }
+  if (!result.ok && result.status === "invalid-port") {
+    return `Invalid port: ${result.reason}`;
+  }
+  if (!result.ok && result.status === "read-error") {
+    return `Failed to read config at ${result.configPath}: ${result.reason}`;
+  }
+  if (!result.ok && result.status === "plan-error") {
+    return `Cannot plan config update for ${result.configPath}: ${result.reason}`;
+  }
+  return `Failed to write config at ${"configPath" in result ? result.configPath : "(unknown)"}: ${"reason" in result ? result.reason : "(unknown)"}`;
+}
 function buildInternalServerWarning() {
   return [
     "WARNING: this opencode is running without an external HTTP port (serverUrl is http://opencode.internal/...).",
@@ -14491,7 +14692,7 @@ function sanitizeJob(job) {
     sanitized.scopeId = trimmed ? trimmed : undefined;
   }
   if (!sanitized.scopeId) {
-    sanitized.scopeId = deriveScopeId(sanitized.workdir || homedir2());
+    sanitized.scopeId = deriveScopeId(sanitized.workdir || homedir3());
   }
   if (sanitized.timeoutSeconds !== undefined) {
     const n = sanitized.timeoutSeconds;
@@ -14668,7 +14869,7 @@ function findJobByName(name, options) {
   return job;
 }
 function updateJobRecord(job, updates) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   const latest = loadScopedJob(scopeId, job.slug) || job;
   const updated = {
     ...latest,
@@ -14680,7 +14881,7 @@ function updateJobRecord(job, updates) {
   return updated;
 }
 function getLogPath(job) {
-  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
   return scopedLogPath(scopeId, job.slug);
 }
 function buildOpencodeArgs(job, options) {
@@ -14764,10 +14965,10 @@ function buildRunEnvironment() {
   };
 }
 function loadSchedulerConfig() {
-  if (!existsSync2(SCHEDULER_CONFIG))
+  if (!existsSync3(SCHEDULER_CONFIG))
     return {};
   try {
-    const raw = readFileSync2(SCHEDULER_CONFIG, "utf-8");
+    const raw = readFileSync3(SCHEDULER_CONFIG, "utf-8");
     const parsed = JSON.parse(raw);
     if (!isRecord(parsed))
       return {};
@@ -14812,11 +15013,11 @@ function getOpencodeVersion(opencodePath) {
 }
 function runJobNow(job) {
   ensureDir(LOGS_DIR);
-  ensureDir(scopeLogsDir(job.scopeId || deriveScopeId(job.workdir || homedir2())));
+  ensureDir(scopeLogsDir(job.scopeId || deriveScopeId(job.workdir || homedir3())));
   const startedAt = new Date().toISOString();
   const logPath = getLogPath(job);
   const logStream = createWriteStream(logPath, { flags: "a" });
-  const workdir = job.workdir || homedir2();
+  const workdir = job.workdir || homedir3();
   logStream.write(`
 === Manual run ${startedAt} ===
 `);
@@ -14916,7 +15117,7 @@ function formatJobDetails(job) {
     `Job: ${job.name}`,
     `Slug: ${job.slug}`,
     `Schedule: ${job.schedule} (${describeCron(job.schedule)})`,
-    `Working Directory: ${job.workdir || homedir2()}`
+    `Working Directory: ${job.workdir || homedir3()}`
   ];
   const run = (() => {
     try {
@@ -15001,7 +15202,7 @@ function formatJobDetails(job) {
 }
 function getJobLogs(job, options) {
   const logPath = getLogPath(job);
-  if (!existsSync2(logPath))
+  if (!existsSync3(logPath))
     return null;
   const maxChars = options?.maxChars ?? 5000;
   const tailLines = options?.tailLines;
@@ -15014,14 +15215,14 @@ function getJobLogs(job, options) {
         }).toString();
         return output.length > maxChars ? output.slice(-maxChars) : output;
       } catch {
-        const content2 = readFileSync2(logPath, "utf-8");
+        const content2 = readFileSync3(logPath, "utf-8");
         const lines = content2.split(/\r?\n/);
         const output = lines.slice(-clampedLines).join(`
 `);
         return output.length > maxChars ? output.slice(-maxChars) : output;
       }
     }
-    const content = readFileSync2(logPath, "utf-8");
+    const content = readFileSync3(logPath, "utf-8");
     return content.length > maxChars ? content.slice(-maxChars) : content;
   } catch {
     return null;
@@ -15519,6 +15720,44 @@ ${content.trim()}
           }
         }
       }),
+      install_server_config: tool({
+        description: [
+          "Write `server.port` (default 0) into ~/.config/opencode/opencode.json so every opencode start",
+          "picks a TCP port and registers itself with the F5 plugin-side runtime registry \u2014 closing the",
+          "loop where scheduled jobs scheduled without an explicit `attachUrl` can be auto-discovered at",
+          "fire-time. Trigger phrases: 'install server config', 'enable port-0 in opencode config',",
+          "'set up auto-attach', 'configure opencode to listen on a port'.",
+          "Single-purpose, idempotent. Strictly limited to that one config file \u2014 does NOT touch shell rc",
+          "files, environment, launchd plists, or anything else.",
+          "Two-step UX: call without `confirm: true` first to get a preview + diff; call again with",
+          "`confirm: true` to actually write. If the config already has `server.port` set to a different",
+          "value, also pass `overwrite: true` to replace it (preview surfaces the previous value first).",
+          "After a successful write the user must restart opencode for it to take effect \u2014 `server.port`",
+          "is read at startup, not live-reloaded. Requires the F7 upstream Zod schema fix to accept",
+          "`port: 0`; on a pre-F7 opencode pass an explicit positive port instead."
+        ].join(" "),
+        args: {
+          port: tool.schema.number().optional().describe(`Port to write into server.port. Default ${DEFAULT_SERVER_PORT} (= try 4096, then OS-assigned random \u2014 matches CLI --port 0). Pass a positive port (e.g. 4096) when the host opencode predates the F7 schema fix.`),
+          overwrite: tool.schema.boolean().optional().describe("Allow replacing an existing server.port set to a different value (default false)."),
+          confirm: tool.schema.boolean().optional().describe("Required to actually write the file. Without this the tool returns a dry-run preview only."),
+          configPath: tool.schema.string().optional().describe(`Override config file path (defaults to ${DEFAULT_OPENCODE_CONFIG_PATH}).`),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json').")
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format);
+          const result = executeInstallServerConfig({
+            port: args.port,
+            overwrite: args.overwrite,
+            confirm: args.confirm,
+            configPath: args.configPath
+          });
+          const text = formatInstallServerConfigResult(result);
+          if (result.ok) {
+            return okResult(format, text, { result });
+          }
+          return errorResult(format, text, { result });
+        }
+      }),
       get_job: tool({
         description: [
           "Fetch full metadata for ONE scheduled job by name or slug: cron schedule, prompt, sessionPolicy,",
@@ -15670,8 +15909,8 @@ ${content.trim()}
             return errorResult(format, `Failed to build invocation: ${msg}`);
           }
           try {
-            const oldScopeId = job.scopeId || deriveScopeId(job.workdir || homedir2());
-            const nextScopeId = updatedJob.scopeId || deriveScopeId(updatedJob.workdir || homedir2());
+            const oldScopeId = job.scopeId || deriveScopeId(job.workdir || homedir3());
+            const nextScopeId = updatedJob.scopeId || deriveScopeId(updatedJob.workdir || homedir3());
             const scopeChanged = oldScopeId !== nextScopeId;
             if (scopeChanged) {
               uninstallJob(job);
@@ -15680,7 +15919,7 @@ ${content.trim()}
             installJob(updatedJob);
             if (scopeChanged) {
               const oldPath = jobFilePath(oldScopeId, job.slug);
-              if (existsSync2(oldPath)) {
+              if (existsSync3(oldPath)) {
                 try {
                   unlinkSync2(oldPath);
                 } catch {}
@@ -15719,8 +15958,8 @@ ${content.trim()}
           }
           uninstallJob(job);
           deleteJobFile(job);
-          const legacyPath = join2(LEGACY_JOBS_DIR, `${job.slug}.json`);
-          if (existsSync2(legacyPath)) {
+          const legacyPath = join3(LEGACY_JOBS_DIR, `${job.slug}.json`);
+          if (existsSync3(legacyPath)) {
             try {
               unlinkSync2(legacyPath);
             } catch {}

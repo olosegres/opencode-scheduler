@@ -26,6 +26,12 @@ import {
   writeRegistryEntry,
   type RegistryEntry,
 } from "./registry"
+import {
+  DEFAULT_OPENCODE_CONFIG_PATH,
+  DEFAULT_SERVER_PORT,
+  executeInstallServerConfig,
+  type InstallServerConfigResult,
+} from "./serverConfig"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -956,6 +962,12 @@ loads this plugin and is reachable externally publishes its own
 entry there, so a sibling TUI launched with \`--port\` can become the
 delivery target automatically — you only need to pass \`attachUrl\`
 explicitly for cross-host or otherwise non-discoverable targets.
+
+To make every opencode start register itself automatically (without
+adding \`--port\` to every shell alias), run \`install_server_config\`
+once. It writes \`server.port: 0\` (= try 4096, then OS-assigned
+random) into \`~/.config/opencode/opencode.json\`. The tool is
+two-step (preview → confirm) and idempotent — see README.
 
 ## Runtime Values: Dates
 
@@ -2730,6 +2742,75 @@ export function initRegistryForPlugin(input: {
 const REGISTRY_EXIT_HANDLERS_INSTALLED = new Set<number>()
 
 /**
+ * Render the result of `executeInstallServerConfig` as a single
+ * agent-readable text block. Each status maps to one short paragraph
+ * with the diff (when relevant) and the next-step hint, so the agent
+ * can copy/paste a useful response back to the user without parsing
+ * structured fields.
+ */
+export function formatInstallServerConfigResult(result: InstallServerConfigResult): string {
+  if (result.ok && result.status === "preview") {
+    return [
+      `Preview only — nothing written.`,
+      `Config: ${result.configPath}`,
+      `Plan: ${result.plan.diff}`,
+      ``,
+      `Call install_server_config again with confirm: true to apply this change.`,
+      result.plan.action.kind === "overwrite-port"
+        ? `Also pass overwrite: true (current server.port = ${result.plan.action.previous}).`
+        : ``,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  }
+
+  if (result.ok && result.status === "noop") {
+    return [
+      `No change needed.`,
+      `Config: ${result.configPath}`,
+      result.plan.diff,
+    ].join("\n")
+  }
+
+  if (result.ok && result.status === "written") {
+    return [
+      `Wrote ${result.configPath}.`,
+      `Change: ${result.plan.diff}`,
+      ``,
+      `Restart opencode for server.port to take effect (read at startup, not live-reloaded).`,
+    ].join("\n")
+  }
+
+  if (!result.ok && result.status === "needs-overwrite") {
+    const action = result.plan.action.kind === "overwrite-port" ? result.plan.action : null
+    const previous = action ? action.previous : "(unknown)"
+    const next = action ? action.next : "(unknown)"
+    return [
+      `Refusing to overwrite an existing different value.`,
+      `Config: ${result.configPath}`,
+      `Current server.port = ${previous}; requested = ${next}.`,
+      ``,
+      `Pass overwrite: true (and confirm: true) to replace it.`,
+    ].join("\n")
+  }
+
+  if (!result.ok && result.status === "invalid-port") {
+    return `Invalid port: ${result.reason}`
+  }
+
+  if (!result.ok && result.status === "read-error") {
+    return `Failed to read config at ${result.configPath}: ${result.reason}`
+  }
+
+  if (!result.ok && result.status === "plan-error") {
+    return `Cannot plan config update for ${result.configPath}: ${result.reason}`
+  }
+
+  // write-error
+  return `Failed to write config at ${"configPath" in result ? result.configPath : "(unknown)"}: ${"reason" in result ? result.reason : "(unknown)"}`
+}
+
+/**
  * Build the F2a warning block appended to `schedule_job` success output
  * when the host opencode is in-process-only and live delivery into the
  * calling TUI is impossible.
@@ -4335,6 +4416,59 @@ export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
             const msg = error instanceof Error ? error.message : String(error)
             return errorResult(format, `Failed to install skill: ${msg}`)
           }
+        },
+      }),
+
+      install_server_config: tool({
+        description: [
+          "Write `server.port` (default 0) into ~/.config/opencode/opencode.json so every opencode start",
+          "picks a TCP port and registers itself with the F5 plugin-side runtime registry — closing the",
+          "loop where scheduled jobs scheduled without an explicit `attachUrl` can be auto-discovered at",
+          "fire-time. Trigger phrases: 'install server config', 'enable port-0 in opencode config',",
+          "'set up auto-attach', 'configure opencode to listen on a port'.",
+          "Single-purpose, idempotent. Strictly limited to that one config file — does NOT touch shell rc",
+          "files, environment, launchd plists, or anything else.",
+          "Two-step UX: call without `confirm: true` first to get a preview + diff; call again with",
+          "`confirm: true` to actually write. If the config already has `server.port` set to a different",
+          "value, also pass `overwrite: true` to replace it (preview surfaces the previous value first).",
+          "After a successful write the user must restart opencode for it to take effect — `server.port`",
+          "is read at startup, not live-reloaded. Requires the F7 upstream Zod schema fix to accept",
+          "`port: 0`; on a pre-F7 opencode pass an explicit positive port instead.",
+        ].join(" "),
+        args: {
+          port: tool.schema
+            .number()
+            .optional()
+            .describe(
+              `Port to write into server.port. Default ${DEFAULT_SERVER_PORT} (= try 4096, then OS-assigned random — matches CLI --port 0). Pass a positive port (e.g. 4096) when the host opencode predates the F7 schema fix.`,
+            ),
+          overwrite: tool.schema
+            .boolean()
+            .optional()
+            .describe("Allow replacing an existing server.port set to a different value (default false)."),
+          confirm: tool.schema
+            .boolean()
+            .optional()
+            .describe("Required to actually write the file. Without this the tool returns a dry-run preview only."),
+          configPath: tool.schema
+            .string()
+            .optional()
+            .describe(`Override config file path (defaults to ${DEFAULT_OPENCODE_CONFIG_PATH}).`),
+          format: tool.schema.string().optional().describe("Optional: output format ('text' or 'json')."),
+        },
+        async execute(args) {
+          const format = normalizeFormat(args.format)
+          const result = executeInstallServerConfig({
+            port: args.port,
+            overwrite: args.overwrite,
+            confirm: args.confirm,
+            configPath: args.configPath,
+          })
+          const text = formatInstallServerConfigResult(result)
+          if (result.ok) {
+            return okResult(format, text, { result })
+          }
+          return errorResult(format, text, { result })
         },
       }),
 

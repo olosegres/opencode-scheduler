@@ -14,6 +14,7 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import type { BadRequestError } from "@opencode-ai/sdk";
 import { type RegistryEntry } from "./registry";
+import { type InstallServerConfigResult } from "./serverConfig";
 type OpencodeRunFormat = "default" | "json";
 type SchedulerEnvMode = "snapshot" | "minimal" | "login-shell";
 /**
@@ -319,6 +320,14 @@ export declare function initRegistryForPlugin(input: {
     entry?: RegistryEntry;
     sweepRemoved: number;
 };
+/**
+ * Render the result of `executeInstallServerConfig` as a single
+ * agent-readable text block. Each status maps to one short paragraph
+ * with the diff (when relevant) and the next-step hint, so the agent
+ * can copy/paste a useful response back to the user without parsing
+ * structured fields.
+ */
+export declare function formatInstallServerConfigResult(result: InstallServerConfigResult): string;
 /**
  * Build the F2a warning block appended to `schedule_job` success output
  * when the host opencode is in-process-only and live delivery into the

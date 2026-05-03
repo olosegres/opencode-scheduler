@@ -227,6 +227,7 @@ Jobs use standard 5-field cron expressions:
 | `get_version` | Show scheduler and opencode versions |
 | `get_skill` | Get built-in skill templates (best practices) |
 | `install_skill` | Install a built-in skill into your repo |
+| `install_server_config` | Write `server.port` (default `0`) into `~/.config/opencode/opencode.json` so every opencode start picks a TCP port and registers itself with the F5 runtime registry. Two-step: preview → confirm. |
 | `get_job` | Fetch job details and metadata |
 | `update_job` | Update an existing job |
 | `delete_job` | Remove a scheduled job |
@@ -240,11 +241,11 @@ Jobs use standard 5-field cron expressions:
 
 | Arg | Default | Meaning |
 |-----|---------|---------|
-| `sessionPolicy` | `current` | `current` / `existing` / `new-per-job` / `new-per-run` — see [Session policies](#session-policies). |
+| `sessionPolicy` | **required** | `current` / `existing` / `new-per-job` / `new-per-run` — see [Session policies](#session-policies). |
 | `sessionId` | — | Required for `existing`; optional explicit override for `current`. |
-| `executionPolicy` | `prefer-live-server` | `prefer-live-server` (default; live HTTP if reachable, else headless) or `headless-only`. |
+| `executionPolicy` | `prefer-live-server` | `prefer-live-server` (default; live HTTP if reachable OR F5 registry surfaces a live opencode that sees the session, else headless) or `headless-only`. |
 | `deliveryPolicy` | `execute` | `execute` (default; wait for idle) or `leave-message` (post with `noReply: true`). |
-| `attachUrl` | — | Live-server base URL for HTTP delivery (e.g. `http://127.0.0.1:4096`). |
+| `attachUrl` | auto-detect | Live-server base URL for HTTP delivery (e.g. `http://127.0.0.1:4096`). When omitted, the plugin auto-promotes the host opencode's `serverUrl` if it's external (F2b) and the runner consults the F5 registry at fire-time. |
 
 See [`docs/SCHEDULING.md`](./docs/SCHEDULING.md) for agent-facing inference rules.
 
