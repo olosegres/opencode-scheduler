@@ -12905,6 +12905,89 @@ Then write your task below it.
 4. **Observable.** Print a short summary at the end with status + outputs.
 5. **Minimal side effects.** Write durable artifacts under outputs/ in the job workdir.
 
+## Choosing a Session Policy
+
+\`schedule_job\` accepts \`sessionPolicy\` (default: \`current\`). Pick by what
+you want the run to feel like in the TUI:
+
+| Policy          | When                                                                                  | Effect                                                                                 |
+| --------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| \`current\`     | "Stream into the chat where I'm scheduling from."                                     | Uses the calling tool's session. Permission rules of that session are unchanged.       |
+| \`existing\`    | "Stream into a specific session I created earlier."                                   | Requires explicit \`sessionId\`. Session permissions unchanged.                        |
+| \`new-per-job\` | "One fresh session that all fires of this job append to."                             | Plugin creates the session at schedule-time with auto-deny on \`question\`/\`plan_*\`. |
+| \`new-per-run\` | "Each fire gets its own brand-new session."                                           | Runner creates a session per fire with the same auto-deny permissions.                 |
+
+Notes:
+
+- \`current\` and \`existing\` do NOT mutate session permissions \u2014 if the
+  session was created interactively, it can still ask questions. Pick
+  \`new-per-job\` / \`new-per-run\` when you need guaranteed silence.
+- An explicit \`sessionId\` beats the calling-tool session: passing both is
+  treated as "use this id".
+
+## Delivery and Execution Policies
+
+Two orthogonal flags control what the job actually does at fire time:
+
+- \`executionPolicy\` (default: \`headless-then-attach\`):
+  - \`headless-then-attach\` \u2014 run the prompt headlessly first, then attach
+    output to the target session. Default.
+  - \`headless-only\` \u2014 never attach. Use for non-interactive workers that
+    only need to write artifacts.
+- \`deliveryPolicy\` (default: \`execute\`):
+  - \`execute\` \u2014 actually run the job. Normal mode.
+  - \`leave-message\` \u2014 do NOT execute the prompt; only post a notification
+    message into the session. Pair with an \`existing\`/\`current\` session
+    so the user sees it.
+
+\`leave-message\` skips execution entirely; only set it when you really
+just want a heads-up dropped into a session.
+
+## Auto-Permissions for new-per-* Sessions
+
+When the plugin creates a session for you (\`new-per-job\` or
+\`new-per-run\`), it bakes in:
+
+- \`question\`     \u2192 \`deny\` for \`*\`
+- \`plan_enter\`   \u2192 \`deny\` for \`*\`
+- \`plan_exit\`    \u2192 \`deny\` for \`*\`
+
+This is enforced server-side, so the model cannot stall the run by asking
+for confirmation or entering plan mode. There is no public \`PATCH\` route
+to mutate an existing session's permissions, which is why \`current\` /
+\`existing\` are not modified.
+
+## Env Parity
+
+At schedule-time the plugin captures the **full terminal env** as a
+per-job snapshot, minus a small denylist
+(\`OPENCODE_PERMISSION\`, \`OPENCODE_SCHEDULER_RUN_ID\`, \`OLDPWD\`,
+\`PWD\`, \`SHLVL\`, \`_\`). The snapshot lives in \`job.json\`; the OS
+scheduler entry (launchd plist, systemd unit, cron preamble) only
+gets the bootstrap env (\`PATH\`, \`HOME\`, \`USER\`, \`SHELL\`).
+\`supervisor.pl\` merges the full snapshot back into \`%ENV\` before
+exec.
+
+What this fixes:
+
+- \`env: node: No such file or directory\` on hosts using NVM / asdf /
+  mise / Volta / Bun without baking only PATH.
+- Lost MCP / plugin tokens (\`OPENCODE_API_KEY\`, MCP server credentials,
+  etc.) \u2014 they carry over because the snapshot is full.
+
+You do not have to do anything in the prompt. If a particular env var
+should NOT be carried, scrub it from the calling shell BEFORE running
+\`schedule_job\`, or extend the denylist in your \`.opencode/config\` env
+section.
+
+## Remote Sessions (attachUrl)
+
+To run against a remote opencode server, pass \`attachUrl\`. The plugin
+will use REST against that URL for both session creation
+(\`new-per-job\`) and verification (\`current\` / \`existing\`). Without
+\`attachUrl\`, all session work goes through the in-process plugin
+client, which does NOT need an open HTTP port.
+
 ## Runtime Values: Dates
 
 If you need local dates, compute them at runtime.
