@@ -12,6 +12,7 @@
  * - Environment variable injection (PATH for node/npx)
  */
 import type { Plugin } from "@opencode-ai/plugin";
+import type { BadRequestError } from "@opencode-ai/sdk";
 type OpencodeRunFormat = "default" | "json";
 type SchedulerEnvMode = "snapshot" | "minimal" | "login-shell";
 /**
@@ -106,6 +107,21 @@ type ExecutionPolicy = "prefer-live-server" | "headless-only";
  *                      to pick up later.
  */
 type DeliveryPolicy = "execute" | "leave-message";
+/**
+ * Permission ruleset applied to sessions created by the scheduler.
+ * Mirrors `opencode-fork/packages/opencode/src/cli/cmd/run.ts:353-369`
+ * so scheduled sessions behave like `opencode run` sessions: no
+ * questions, no plan toggling.
+ *
+ * NOT applied to sessions chosen via `current` or `existing` — there
+ * is no public PATCH route to mutate an existing session's permission.
+ * Users who want strict no-questions pick `new-per-job` / `new-per-run`.
+ */
+export type ScheduledPermissionRule = {
+    permission: string;
+    action: "deny";
+    pattern: string;
+};
 type JobInvocation = {
     command: string;
     args: string[];
@@ -181,5 +197,40 @@ export declare function validateSessionPolicyArgs(input: {
     attachUrl?: string;
     toolSessionID?: string;
 }): string | undefined;
+/**
+ * Narrow shape of the OpenCode SDK client we need for session creation.
+ * Structurally compatible with `OpencodeClient` so `client` can be passed
+ * directly without a cast. `body.permission` is supported by the server
+ * route even though older SDK versions omit it from the body type — we
+ * include it here to make that contract explicit.
+ */
+export type SchedulerSessionClient = {
+    session: {
+        create(options: {
+            body?: {
+                parentID?: string;
+                title?: string;
+                permission?: readonly ScheduledPermissionRule[];
+            };
+        }): Promise<{
+            data?: {
+                id?: string;
+            };
+            error?: BadRequestError | {
+                message?: string;
+            };
+        }>;
+    };
+};
+/**
+ * Create a local scheduler session through the plugin-provided client.
+ * OpenCode wires that client to Server.App().fetch in-process; unlike
+ * serverUrl, it does not require an externally listening HTTP port.
+ */
+export declare function createSchedulerSessionWithClient(input: {
+    client: SchedulerSessionClient;
+    title: string;
+    permission: readonly ScheduledPermissionRule[];
+}): Promise<string>;
 export declare const SchedulerPlugin: Plugin;
 export default SchedulerPlugin;

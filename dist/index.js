@@ -14717,7 +14717,30 @@ function resolveSessionApiBase(attachUrl, serverUrl) {
     return attachUrl.replace(/\/+$/, "");
   return serverUrl.toString().replace(/\/+$/, "");
 }
-async function createSchedulerSession(input) {
+function getSchedulerSessionCreateErrorMessage(error45) {
+  if (!error45)
+    return "unknown error";
+  if ("message" in error45 && typeof error45.message === "string")
+    return error45.message;
+  if ("errors" in error45 && Array.isArray(error45.errors)) {
+    const first = error45.errors.find((e) => typeof e.message === "string");
+    if (first && typeof first.message === "string")
+      return first.message;
+  }
+  return JSON.stringify(error45);
+}
+async function createSchedulerSessionWithClient(input) {
+  const body = { title: input.title, permission: input.permission };
+  const result = await input.client.session.create({ body });
+  if (result.error) {
+    throw new Error(`client.session.create failed: ${getSchedulerSessionCreateErrorMessage(result.error)}`);
+  }
+  if (!result.data?.id) {
+    throw new Error("client.session.create returned no id");
+  }
+  return result.data.id;
+}
+async function createSchedulerSessionViaFetch(input) {
   const res = await fetch(`${input.baseUrl}/session`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -14893,8 +14916,12 @@ var SchedulerPlugin = async ({ client, serverUrl }) => {
             }
           } else if (sessionPolicy === "new-per-job") {
             try {
-              resolvedSessionId = await createSchedulerSession({
+              resolvedSessionId = attachUrl ? await createSchedulerSessionViaFetch({
                 baseUrl: sessionApiBase,
+                title: args.name,
+                permission: SCHEDULED_PERMS
+              }) : await createSchedulerSessionWithClient({
+                client,
                 title: args.name,
                 permission: SCHEDULED_PERMS
               });
@@ -15444,15 +15471,7 @@ ${logs}`, { job, logPath, logs });
     }
   };
 };
-var src_default = SchedulerPlugin;
 export {
-  validateSessionPolicyArgs,
-  pickBootstrapEnv,
-  parseSessionPolicy,
-  parseExecutionPolicy,
-  parseDeliveryPolicy,
-  getEnhancedPath,
-  src_default as default,
-  captureJobEnv,
+  SchedulerPlugin as default,
   SchedulerPlugin
 };

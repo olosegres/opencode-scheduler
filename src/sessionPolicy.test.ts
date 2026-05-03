@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import {
+  createSchedulerSessionWithClient,
   parseDeliveryPolicy,
   parseExecutionPolicy,
   parseSessionPolicy,
   validateSessionPolicyArgs,
 } from "./index"
+import type { ScheduledPermissionRule, SchedulerSessionClient } from "./index"
 
 describe("parseSessionPolicy", () => {
   test("defaults to 'current' when undefined or empty", () => {
@@ -140,5 +142,72 @@ describe("validateSessionPolicyArgs", () => {
       toolSessionID: "ses_abc",
     })
     expect(err).toBeUndefined()
+  })
+})
+
+describe("createSchedulerSessionWithClient", () => {
+  const scheduledPermissions: readonly ScheduledPermissionRule[] = [
+    { permission: "question", action: "deny", pattern: "*" },
+    { permission: "plan_enter", action: "deny", pattern: "*" },
+    { permission: "plan_exit", action: "deny", pattern: "*" },
+  ]
+
+  test("creates the session through the plugin client with permissions", async () => {
+    let capturedBody = ""
+    const client: SchedulerSessionClient = {
+      session: {
+        async create(options) {
+          capturedBody = JSON.stringify(options.body)
+          return { data: { id: "ses_scheduler" } }
+        },
+      },
+    }
+
+    const sessionId = await createSchedulerSessionWithClient({
+      client,
+      title: "verify-v0",
+      permission: scheduledPermissions,
+    })
+
+    expect(sessionId).toBe("ses_scheduler")
+    expect(capturedBody).toContain('"title":"verify-v0"')
+    expect(capturedBody).toContain('"permission"')
+    expect(capturedBody).toContain('"plan_enter"')
+  })
+
+  test("reports client creation failures", async () => {
+    const client: SchedulerSessionClient = {
+      session: {
+        async create() {
+          return { error: { message: "boom" } }
+        },
+      },
+    }
+
+    await expect(
+      createSchedulerSessionWithClient({
+        client,
+        title: "verify-v0",
+        permission: scheduledPermissions,
+      })
+    ).rejects.toThrow(/client\.session\.create failed: boom/)
+  })
+
+  test("throws when the client returns data without an id", async () => {
+    const client: SchedulerSessionClient = {
+      session: {
+        async create() {
+          return { data: {} }
+        },
+      },
+    }
+
+    await expect(
+      createSchedulerSessionWithClient({
+        client,
+        title: "verify-v0",
+        permission: scheduledPermissions,
+      })
+    ).rejects.toThrow(/no id/)
   })
 })

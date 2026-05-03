@@ -107,7 +107,7 @@ Each fire-time attempt appends a structured record to `~/.config/opencode/schedu
 
 ### Env behavior
 
-At schedule-time, the plugin captures the **full terminal env** as a per-job snapshot, minus a small denylist (`OPENCODE_PERMISSION`, `OPENCODE_SCHEDULER_RUN_ID`, `OLDPWD`, `PWD`, `SHLVL`, `_`). The snapshot is written into the OS scheduler entry (launchd plist `EnvironmentVariables`, systemd `Environment="K=V"`, cron inline preamble) and merged back into `%ENV` by `supervisor.pl` before exec.
+At schedule-time, the plugin captures the **full terminal env** as a per-job snapshot, minus a small denylist (`OPENCODE_PERMISSION`, `OPENCODE_SCHEDULER_RUN_ID`, `OLDPWD`, `PWD`, `SHLVL`, `_`). The snapshot is written into `job.json`; the OS scheduler entry only gets the bootstrap env (`PATH`, `HOME`, `USER`, `SHELL`). `supervisor.pl` merges the full snapshot back into `%ENV` before exec.
 
 This fixes the `env: node: No such file or directory` failure on hosts using NVM/asdf/mise/Volta/pnpm/Bun without baking only PATH; MCP/plugin tokens (`OPENCODE_API_KEY`, MCP server credentials, etc.) carry over too.
 

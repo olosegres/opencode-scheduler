@@ -13,6 +13,7 @@
  */
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
+import type { BadRequestError } from "@opencode-ai/sdk"
 import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
@@ -724,7 +725,7 @@ type DeliveryPolicy = "execute" | "leave-message"
  * is no public PATCH route to mutate an existing session's permission.
  * Users who want strict no-questions pick `new-per-job` / `new-per-run`.
  */
-type ScheduledPermissionRule = { permission: string; action: "deny"; pattern: string }
+export type ScheduledPermissionRule = { permission: string; action: "deny"; pattern: string }
 const SCHEDULED_PERMS: readonly ScheduledPermissionRule[] = [
   { permission: "question", action: "deny", pattern: "*" },
   { permission: "plan_enter", action: "deny", pattern: "*" },
@@ -3177,11 +3178,69 @@ function resolveSessionApiBase(attachUrl: string | undefined, serverUrl: URL): s
 }
 
 /**
- * Create a session via raw fetch. Bypasses the SDK because v1's
- * `SessionCreateData.body` does not type `permission` even though the
- * server route accepts it. Returns the new session id, or throws.
+ * Narrow shape of the OpenCode SDK client we need for session creation.
+ * Structurally compatible with `OpencodeClient` so `client` can be passed
+ * directly without a cast. `body.permission` is supported by the server
+ * route even though older SDK versions omit it from the body type — we
+ * include it here to make that contract explicit.
  */
-async function createSchedulerSession(input: {
+export type SchedulerSessionClient = {
+  session: {
+    create(options: {
+      body?: {
+        parentID?: string
+        title?: string
+        permission?: readonly ScheduledPermissionRule[]
+      }
+    }): Promise<{
+      data?: { id?: string }
+      // The SDK's runtime error is `BadRequestError` (`{ data, errors,
+      // success }`); some hand-rolled mocks pass a `{ message }` form.
+      // Accept both so tests don't need to mirror the full SDK shape.
+      error?: BadRequestError | { message?: string }
+    }>
+  }
+}
+
+function getSchedulerSessionCreateErrorMessage(
+  error: BadRequestError | { message?: string } | undefined,
+): string {
+  if (!error) return "unknown error"
+  if ("message" in error && typeof error.message === "string") return error.message
+  if ("errors" in error && Array.isArray(error.errors)) {
+    const first = error.errors.find((e) => typeof e.message === "string")
+    if (first && typeof first.message === "string") return first.message
+  }
+  return JSON.stringify(error)
+}
+
+/**
+ * Create a local scheduler session through the plugin-provided client.
+ * OpenCode wires that client to Server.App().fetch in-process; unlike
+ * serverUrl, it does not require an externally listening HTTP port.
+ */
+export async function createSchedulerSessionWithClient(input: {
+  client: SchedulerSessionClient
+  title: string
+  permission: readonly ScheduledPermissionRule[]
+}): Promise<string> {
+  const body = { title: input.title, permission: input.permission }
+  const result = await input.client.session.create({ body })
+  if (result.error) {
+    throw new Error(`client.session.create failed: ${getSchedulerSessionCreateErrorMessage(result.error)}`)
+  }
+  if (!result.data?.id) {
+    throw new Error("client.session.create returned no id")
+  }
+  return result.data.id
+}
+
+/**
+ * Create a session via raw fetch for an explicit remote attachUrl target.
+ * The plugin client is local-only, so remote session creation still needs
+ * REST.
+ */
+async function createSchedulerSessionViaFetch(input: {
   baseUrl: string
   title: string
   permission: readonly ScheduledPermissionRule[]
@@ -3431,22 +3490,23 @@ export const SchedulerPlugin: Plugin = async ({ client, serverUrl }) => {
              }
            } else if (sessionPolicy === "new-per-job") {
              try {
-               resolvedSessionId = await createSchedulerSession({
-                 baseUrl: sessionApiBase,
-                 title: args.name,
-                 permission: SCHEDULED_PERMS,
-               })
+               resolvedSessionId = attachUrl
+                 ? await createSchedulerSessionViaFetch({
+                     baseUrl: sessionApiBase,
+                     title: args.name,
+                     permission: SCHEDULED_PERMS,
+                   })
+                 : await createSchedulerSessionWithClient({
+                     client,
+                     title: args.name,
+                     permission: SCHEDULED_PERMS,
+                   })
              } catch (error) {
                const msg = error instanceof Error ? error.message : String(error)
                return errorResult(format, `sessionPolicy='new-per-job': ${msg}`)
              }
            }
            // new-per-run: leave resolvedSessionId undefined; runner creates per fire.
-
-           // Mark `client` as intentionally unused for now (kept on the plugin
-           // signature for forward-compatibility once the SDK adds a typed
-           // session.create({ permission }) variant).
-           void client
 
            // Capture per-job env snapshot. loadSchedulerConfig() throws on
            // invalid env.mode / denylisted env.set keys — route through the
