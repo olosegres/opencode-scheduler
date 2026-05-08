@@ -20,37 +20,90 @@ Add to your `opencode.json`:
 }
 ```
 
+## First-time setup (recommended once per machine)
+
+Scheduled runs can deliver into an **open** opencode session live (the message appears in your TUI as it fires) — but only if your opencode is listening on a TCP port. Two ways to enable this:
+
+1. **CLI flag** — launch opencode with `--port 0` (any available port). Add it to your shell alias / launcher and you're done. Works on every binary today.
+2. **Config** — ask the agent: `Set up live scheduled delivery for opencode` → it calls `install_server_config` and writes `server.port: 0` into `~/.config/opencode/opencode.json` after a confirmation step. After this, every future opencode start auto-binds a port and registers itself; no per-launcher flag. Requires an opencode build whose schema accepts `server.port: 0` (see [docs/SCHEDULING.md](./docs/SCHEDULING.md#three-host-opencode-hosting-modes) for compatibility).
+
+If you skip this, scheduled runs still work — they just deliver via headless `opencode run` and the open TUI doesn't refresh until you reopen the session. `schedule_job` warns you when this is the case.
+
 ## Examples
 
-**Daily deal hunting:**
+These are spoken-word phrases for the opencode agent, not literal CLI commands. The agent translates them into `schedule_job` calls. `sessionPolicy` is always required — the agent infers it from your phrasing when one is implied, or asks you to pick when it's not.
+
+### Basic recurring (writes into the chat you're in)
+
 ```
-Schedule a daily job at 9am to search for standing desks under $300
+Schedule a daily reminder at 9am to summarize my unread GitHub notifications,
+in this chat
 ```
 
-**Weekly reports:**
+The agent picks `sessionPolicy='current'` because you said "in this chat". Result lands in the same TUI thread you're typing into.
+
+### Independent background work (one dedicated session, reused on every fire)
+
 ```
-Schedule a job every Monday at 8am to summarize my GitHub notifications
+Set up an independent job every 6 hours to check my standing-desk price
+search and post results
 ```
 
-**Recurring reminders:**
+"Independent" → `sessionPolicy='new-per-job'`. The agent creates one fresh session at schedule-time with `question` / `plan_enter` / `plan_exit` denied so it can't block on prompts; every fire reuses that same session so you can scroll back through the history.
+
+### Stateless probe (fresh session every fire)
+
 ```
-Schedule a job every 6 hours to check if my website is up and alert me on Slack if it's down
+Every 15 minutes, ping my website's healthcheck URL in a fresh chat each time
+and notify me only if it's down
 ```
+
+"Fresh chat each time" → `sessionPolicy='new-per-run'`. Useful when you don't want history to accumulate (status probes, backups, alerting).
+
+### Queue a message (no LLM call at fire-time)
+
+```
+Schedule a daily 8am message in this chat: "Time to start work — check the
+overnight Telegram threads, then plan the day". Don't actually run the
+prompt, just leave the message for me to read.
+```
+
+`deliveryPolicy='leave-message'` — `noReply: true` is set on the HTTP delivery so the message lands in storage and the TUI shows it, but no LLM round-trip happens. Useful for "queue this for me to react to later" patterns.
+
+### Remote opencode (different machine / different port)
+
+```
+Schedule on the server at http://192.168.1.42:4096, every Monday at 8am,
+in a fresh dedicated session, to run the weekly maintenance playbook
+```
+
+Explicit `attachUrl` overrides the auto-detection. The agent confirms `sessionPolicy` ('new-per-job' here because "dedicated session") and creates the session on the remote server.
+
+### Verify a job
+
+```
+Run the standing-desk job now and show me the last run record
+```
+
+`run_job` fires immediately; `job_logs` (or `get_job`) shows the JSONL ledger entry — `delivery: "live" | "headless"`, `attachUrlSource: "job" | "registry"`, `httpStatus`, `durationMs`, etc.
 
 ## Commands
 
-| Command | Example |
-|---------|---------|
-| Schedule a job | `Schedule a daily job at 9am to...` |
-| List jobs | `Show my scheduled jobs` |
-| Get version | `Show scheduler version` |
-| Install skill template | `Install the scheduled job best practices skill` |
-| Get job | `Show details for standing-desk` |
-| Update job | `Update standing-desk to run at 10am` |
-| Run immediately | `Run the standing-desk job now` |
-| View logs | `Show logs for standing-desk` |
-| Delete | `Delete the standing-desk job` |
-| Global cleanup (dry run) | `Run scheduler global cleanup` |
+These are user → agent phrases that map onto a single tool call. For `schedule_job` specifically, the agent will infer `sessionPolicy` from your phrasing or ask you to pick one — it's required, never auto-defaulted.
+
+| User says | Tool fired |
+|---|---|
+| `Schedule a daily job at 9am to ...` | `schedule_job` (agent infers or asks for `sessionPolicy`) |
+| `Set up live scheduled delivery for opencode` | `install_server_config` (preview → confirm) |
+| `Show my scheduled jobs` | `list_jobs` |
+| `Show details for standing-desk` | `get_job` |
+| `Update standing-desk to run at 10am` | `update_job` |
+| `Run the standing-desk job now` | `run_job` |
+| `Show logs for standing-desk` | `job_logs` |
+| `Delete the standing-desk job` | `delete_job` |
+| `Show scheduler version` | `get_version` |
+| `Install the scheduled-job-best-practices skill` | `install_skill` (auto-installed on first `schedule_job`, this is for explicit refresh) |
+| `Run scheduler global cleanup` | `cleanup_global` (dry-run by default) |
 
 ## How It Works
 
@@ -335,7 +388,7 @@ Update the standing-desk job to use attachUrl http://localhost:4096
 Force a fresh copy (overwrite local edits) or pre-seed before scheduling:
 
 ```
-Install the scheduled job best practices skill
+Install the scheduled-job-best-practices skill
 ```
 
 This calls the plugin’s `install_skill` tool. Pass `overwrite=true` if a previous version is already present and you want it replaced.
